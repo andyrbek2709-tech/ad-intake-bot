@@ -5,6 +5,13 @@ import { registerHandlers } from "./bot/handlers.js";
 import { startFollowupScheduler } from "./bot/followup.js";
 import { setBotUsernameForTenants, getManagerChatId } from "./config/tenants.js";
 
+// Logger utility
+const logger = {
+  error: (msg, ctx = {}) => console.error(JSON.stringify({ level: 'ERROR', msg, ...ctx, ts: new Date().toISOString() })),
+  warn: (msg, ctx = {}) => console.warn(JSON.stringify({ level: 'WARN', msg, ...ctx, ts: new Date().toISOString() })),
+  info: (msg, ctx = {}) => console.log(JSON.stringify({ level: 'INFO', msg, ...ctx, ts: new Date().toISOString() }))
+};
+
 const required = ["BOT_TOKEN", "OPENAI_API_KEY", "SUPABASE_URL", "SUPABASE_KEY", "MANAGER_CHAT_ID"];
 for (const key of required) {
   if (!process.env[key]) {
@@ -38,7 +45,7 @@ if (process.env.WEBHOOK_DOMAIN) {
     await bot.telegram.setWebhook(webhookUrl);
     console.log(`Webhook set: ${webhookUrl}`);
   } catch (err) {
-    console.error(`Failed to set webhook: ${err.message}`);
+    logger.error('Failed to set webhook', { error: err.message, stack: err.stack });
   }
 } else {
   await bot.telegram.deleteWebhook();
