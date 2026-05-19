@@ -13,7 +13,8 @@
     "build:telegram-logo": "node scripts/build-telegram-logo.mjs",
     "dump:last-conv": "node scripts/dump-last-conversation.mjs",
     "dump:transcript": "node scripts/export-conversation-by-lead.mjs",
-    "railway:sync-supabase": "node scripts/sync-supabase-to-railway.mjs"
+    "railway:sync-supabase": "node scripts/sync-supabase-to-railway.mjs",
+    "init:kb": "node scripts/initialize-knowledge-base.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.105.1",
