@@ -96,7 +96,6 @@ import {
   resolveAgencyLogoPath,
 } from "../config/agency.js";
 import fs from "fs";
-import { exportLeadToAllIntegrations } from "../services/crmExport.js";
 import { extractTextFromPdfBuffer } from "../services/fileExtract.js";
 import { ORDER_TEMPLATES, getTemplateById } from "./templatesCatalog.js";
 import { isManagerUserId, hasManagerUserAllowlist } from "../config/roles.js";
@@ -1673,7 +1672,6 @@ async function notifyManager(ctx, order, lang = "ru", rawArgs = {}, lead = null,
 
   if (lead) {
     try {
-      const crm = await exportLeadToAllIntegrations({
         lead_id: lead.id,
         order_id: order.id,
         service_type: order.service_type,
