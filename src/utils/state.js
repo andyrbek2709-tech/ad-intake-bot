@@ -1,0 +1,175 @@
+// In-memory state for dialog contexts.
+// Key: chatId (string), Value: { messages, files, lang, flagShown, updatedAt }
+
+const conversations = new Map();
+const TTL_MS = 60 * 60 * 1000; // 60 minutes — intake briefs can take a while
+
+export function getContext(chatId) {
+  const key = String(chatId);
+  const entry = conversations.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.updatedAt > TTL_MS) {
+    conversations.delete(key);
+    return null;
+  }
+  return entry;
+}
+
+export function setContext(chatId, ctxData) {
+  const key = String(chatId);
+  conversations.set(key, { ...ctxData, updatedAt: Date.now() });
+}
+
+export function clearContext(chatId) {
+  conversations.delete(String(chatId));
+}
+
+export function addFile(chatId, fileUrl) {
+  const key = String(chatId);
+  const entry = conversations.get(key) || { messages: [], files: [] };
+  entry.files = [...(entry.files || []), fileUrl];
+  entry.updatedAt = Date.now();
+  conversations.set(key, entry);
+}
+
+export function setLang(chatId, lang) {
+  const key = String(chatId);
+  const entry = conversations.get(key) || { messages: [], files: [] };
+  const langChanged = entry.lang !== lang;
+  entry.lang = lang;
+  // When the language changes (or is set for the first time) — show the flag
+  // on the next reply.
+  if (langChanged) entry.flagShown = false;
+  entry.updatedAt = Date.now();
+  conversations.set(key, entry);
+}
+
+export function consumeFlag(chatId) {
+  const key = String(chatId);
+  const entry = conversations.get(key);
+  if (!entry) return false;
+  if (entry.flagShown) return false;
+  entry.flagShown = true;
+  entry.updatedAt = Date.now();
+  conversations.set(key, entry);
+  return true;
+}
+
+// Periodic cleanup
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of conversations) {
+    if (now - entry.updatedAt > TTL_MS) {
+      conversations.delete(key);
+    }
+  }
+}, 5 * 60 * 1000);
+
+// ─── Manager Assist drafts ───────────────────────────────────────────────────
+// In-memory store предложенных AI-ответов менеджеру.
+// key: msgId (number), value: { leadId, text, lang, createdAt }
+// TTL: 30 минут.
+
+const assistDrafts = new Map();
+const ASSIST_TTL_MS = 30 * 60 * 1000;
+
+export function setAssistDraft(msgId, draft) {
+  assistDrafts.set(Number(msgId), { ...draft, createdAt: Date.now() });
+}
+
+export function getAssistDraft(msgId) {
+  const key = Number(msgId);
+  const entry = assistDrafts.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.createdAt > ASSIST_TTL_MS) {
+    assistDrafts.delete(key);
+    return null;
+  }
+  return entry;
+}
+
+export function deleteAssistDraft(msgId) {
+  assistDrafts.delete(Number(msgId));
+}
+
+// Periodic cleanup
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of assistDrafts) {
+    if (now - entry.createdAt > ASSIST_TTL_MS) {
+      assistDrafts.delete(key);
+    }
+  }
+}, 5 * 60 * 1000);
+
+// ─── Proposal Drafts (КП) ────────────────────────────────────────────────────
+// In-memory store черновиков КП — менеджер ревьюит и жмёт Send/Edit/Cancel.
+// key: msgId (number), value: { leadId, text, lang, createdAt }
+// TTL: 30 минут.
+
+const proposalDrafts = new Map();
+const PROPOSAL_TTL_MS = 30 * 60 * 1000;
+
+export function setProposalDraft(msgId, draft) {
+  proposalDrafts.set(Number(msgId), { ...draft, createdAt: Date.now() });
+}
+
+export function getProposalDraft(msgId) {
+  const key = Number(msgId);
+  const entry = proposalDrafts.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.createdAt > PROPOSAL_TTL_MS) {
+    proposalDrafts.delete(key);
+    return null;
+  }
+  return entry;
+}
+
+export function deleteProposalDraft(msgId) {
+  proposalDrafts.delete(Number(msgId));
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of proposalDrafts) {
+    if (now - entry.createdAt > PROPOSAL_TTL_MS) {
+      proposalDrafts.delete(key);
+    }
+  }
+}, 5 * 60 * 1000);
+
+// ─── Manager-only state (для /teach и подобных команд) ───────────────────────
+// Хранит ожидаемое состояние менеджера, например awaiting_teach_input.
+// key: managerChatId (string), value: { state, payload, createdAt }
+// TTL: 10 минут — менеджер должен успеть наговорить заметку.
+
+const managerStates = new Map();
+const MANAGER_STATE_TTL_MS = 10 * 60 * 1000;
+
+export function setManagerState(chatId, state, payload = null) {
+  managerStates.set(String(chatId), { state, payload, createdAt: Date.now() });
+}
+
+export function getManagerState(chatId) {
+  const key = String(chatId);
+  const entry = managerStates.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.createdAt > MANAGER_STATE_TTL_MS) {
+    managerStates.delete(key);
+    return null;
+  }
+  return entry;
+}
+
+export function clearManagerState(chatId) {
+  managerStates.delete(String(chatId));
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of managerStates) {
+    if (now - entry.createdAt > MANAGER_STATE_TTL_MS) {
+      managerStates.delete(key);
+    }
+  }
+}, 5 * 60 * 1000);

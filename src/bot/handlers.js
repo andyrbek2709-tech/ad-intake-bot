@@ -1,0 +1,2916 @@
+import {
+  chat,
+  detectLang,
+  describeImage,
+  classifyImageForIntake,
+  extractPartialBrief,
+  classifyServiceTypeLLM,
+  extractData,
+  mergeData,
+  missingRequiredFields,
+  assistManagerReply,
+  polishRelayForClient,
+  extractKnowledge,
+  createEmbedding,
+  summarizeManagerCalculation,
+  generateProposal,
+  estimatePriceHint,
+} from "../services/openai.js";
+import { transcribeVoice } from "../services/whisper.js";
+import {
+  upsertConversation,
+  completeConversation,
+  saveOrder,
+  getOrderById,
+  updateOrderStatus,
+  getOrdersByStatus,
+  getOrdersToday,
+  getAnalyticsSnapshot,
+  getActiveConversationByChatId,
+  getLatestConversationByTelegramChatId,
+  getConversationFullHistory,
+} from "../services/supabase.js";
+import {
+  createLead,
+  getLeadById,
+  getActiveLeadByChatId,
+  updateLead,
+  getLeadsByStatus,
+  getLeadsByTier,
+  getLeadsSummary,
+  getConversationHistoryForLead,
+  appendConversationMessage,
+  calcLeadScore,
+  scoreBadge,
+} from "../services/leads.js";
+import { scheduleManagerLeadActionNudge } from "./managerLeadNudge.js";
+import {
+  getContext,
+  setContext,
+  clearContext,
+  addFile,
+  setLang,
+  consumeFlag,
+  setAssistDraft,
+  getAssistDraft,
+  deleteAssistDraft,
+  setProposalDraft,
+  getProposalDraft,
+  deleteProposalDraft,
+  setManagerState,
+  getManagerState,
+  clearManagerState,
+} from "../utils/state.js";
+import {
+  addKnowledge,
+  listKnowledge,
+  deleteKnowledge,
+  getKnowledgeById,
+  searchKnowledge,
+  KB_CATEGORIES,
+} from "../services/knowledgeBase.js";
+import { getLangMeta, CONTACT_REASK } from "./prompts.js";
+import {
+  keywordClassify,
+  normalizeServiceType,
+  carryOverFields,
+  nextStepFor,
+  SCENARIOS,
+} from "./scenarios.js";
+import { getQuestion } from "./questions.js";
+import {
+  makeEmptyOrder,
+  normalizeToSchema,
+  REQUIRED_FIELDS,
+} from "./orderSchema.js";
+import { buildKnowledgeContext } from "./promptContext.js";
+import { shouldTriggerUpsell, buildUpsellPromptBlock, UPSELL_MAP } from "./upsell.js";
+import { getManagerChatId } from "../config/tenants.js";
+import {
+  AGENCY_NAME,
+  buildStartPhotoCaption,
+  buildStartWelcomeBody,
+  buildStartWelcomeFallbackText,
+  buildResetWelcomeText,
+  getManagerLeadsKeyboardMarkup,
+  resolveAgencyLogoPath,
+} from "../config/agency.js";
+import fs from "fs";
+import { exportLeadToAllIntegrations } from "../services/crmExport.js";
+import { extractTextFromPdfBuffer } from "../services/fileExtract.js";
+import { ORDER_TEMPLATES, getTemplateById } from "./templatesCatalog.js";
+import { isManagerUserId, hasManagerUserAllowlist } from "../config/roles.js";
+import {
+  setManagerReplyMode,
+  getManagerReplyMode,
+  clearManagerReplyMode,
+} from "../utils/managerRelay.js";
+import {
+  ensureIntake,
+  extractServicesQueueFromText,
+  orderCarryForward,
+  resetServiceSlotFields,
+  snapshotForService,
+  formatClientBrief,
+  isAffirmative,
+  tryCollapseSpuriousOtherPlusServiceQueue,
+} from "./intakeHelpers.js";
+
+let _bot = null;
+
+/** Доступ к менеджерским slash-командам. */
+function managerCommandAllowed(ctx) {
+  const fromId = ctx.from?.id;
+  if (fromId == null) return false;
+  if (hasManagerUserAllowlist()) return isManagerUserId(fromId);
+  return String(ctx.chat?.id) === getManagerChatId();
+}
+
+// In-memory state для clarify-flow: ждём ответа менеджера на ForceReply.
+// key = managerChatId (string), value = { leadId, promptMessageId }
+const pendingClarify = new Map();
+
+// In-memory state для proposal-flow: менеджер жмёт «✏️ Изменить» у КП —
+// перехватываем его следующее сообщение (reply на ForceReply).
+// key = managerChatId (string), value = { leadId, promptMessageId }
+const pendingProposalEdit = new Map();
+
+export function registerHandlers(bot) {
+  _bot = bot;
+
+  bot.start(handleStart);
+
+  // Manager-only commands (по whitelist user id или legacy: канал группы менеджеров).
+  const ownerOnly = (fn) => async (ctx) => {
+    if (!managerCommandAllowed(ctx)) return;
+    return fn(ctx);
+  };
+  bot.command("new", ownerOnly((ctx) => handleOwnerList(ctx, "new", "🆕 Новые заявки")));
+  bot.command("active", ownerOnly((ctx) => handleOwnerList(ctx, "in_progress", "🔄 В работе")));
+  bot.command("today", ownerOnly(handleOwnerToday));
+  bot.command("leads", ownerOnly(handleLeadsCommand));
+  bot.command("reply", ownerOnly(handleReplyCommand));
+  bot.command("assist", ownerOnly(handleAssistCommand));
+  bot.command("proposal", ownerOnly(handleProposalCommand));
+  bot.command("stats", ownerOnly(handleOwnerStats));
+  bot.command("templates", handleTemplatesCommand);
+  bot.command("teach", ownerOnly(handleTeachCommand));
+  bot.command("knowledge", ownerOnly(handleKnowledgeCommand));
+  bot.command("transcript", ownerOnly(handleTranscriptCommand));
+  bot.command("help", handleHelp);
+  bot.command("reset", handleReset);
+
+  bot.on("text", handleText);
+  bot.on("voice", handleVoice);
+  bot.on("audio", handleVoice);
+  bot.on("photo", handleFile);
+  bot.on("document", handleFile);
+  bot.on("callback_query", handleCallback);
+}
+
+function isManagerOperationsChat(ctx) {
+  return String(ctx.chat?.id) === getManagerChatId();
+}
+
+function isClientPrivateChat(ctx) {
+  return ctx.chat?.type === "private";
+}
+
+function intakeMetadata(entry) {
+  if (!entry) return {};
+  const intake = ensureIntake(entry);
+  return {
+    order: entry.orderData || null,
+    service_code: entry.serviceCode || null,
+    intake_state: {
+      servicesQueue: intake.servicesQueue,
+      idx: intake.idx,
+      perService: intake.perService,
+    },
+    pending_finalize: entry.pendingFinalize || null,
+  };
+}
+
+async function hydrateClientContextFromDb(chatId) {
+  try {
+    const conv = await getActiveConversationByChatId(chatId);
+    if (conv && Array.isArray(conv.history)) {
+      if (conv.history.length > 0) {
+        const meta = conv.metadata || {};
+        const row = {
+          messages: [...conv.history],
+          files: conv.files || [],
+          lang: conv.lang || null,
+          flagShown: true,
+          serviceCode: meta.service_code || null,
+          orderData: makeEmptyOrder(),
+          upsellShown: false,
+          pendingFinalize: meta.pending_finalize || null,
+        };
+        if (meta.order && typeof meta.order === "object") {
+          row.orderData = mergeData(makeEmptyOrder(), meta.order);
+        }
+        ensureIntake(row);
+        if (meta.intake_state && typeof meta.intake_state === "object") {
+          if (Array.isArray(meta.intake_state.servicesQueue))
+            row.intake.servicesQueue = meta.intake_state.servicesQueue;
+          if (Number.isInteger(meta.intake_state.idx)) row.intake.idx = meta.intake_state.idx;
+          if (meta.intake_state.perService && typeof meta.intake_state.perService === "object")
+            row.intake.perService = { ...meta.intake_state.perService };
+        }
+        if (meta.service_code) row.serviceCode = meta.service_code;
+        setContext(chatId, row);
+        return row;
+      }
+      // Активная запись есть, но история пустая (типично после /reset): НЕ подтягивать старый диалог из лида —
+      // иначе /start снова показывает «незавершённый заказ».
+      const rowFresh = {
+        messages: [],
+        files: Array.isArray(conv.files) ? conv.files : [],
+        lang: conv.lang || null,
+        flagShown: true,
+        serviceCode: null,
+        orderData: makeEmptyOrder(),
+        upsellShown: false,
+        pendingFinalize: null,
+      };
+      ensureIntake(rowFresh);
+      rowFresh.intake.servicesQueue = [];
+      rowFresh.intake.idx = 0;
+      rowFresh.intake.perService = {};
+      setContext(chatId, rowFresh);
+      return rowFresh;
+    }
+
+    // Если активного intake-диалога уже нет (после finalize), но есть активный лид,
+    // восстанавливаем контекст из лида, чтобы ответы клиента после «Уточнить»
+    // не теряли связь с заказом.
+    const activeLead = await getActiveLeadByChatId(chatId);
+    if (!activeLead) return null;
+
+    const leadData = activeLead.data && typeof activeLead.data === "object" ? activeLead.data : {};
+    const seedOrder = mergeData(
+      makeEmptyOrder(),
+      leadData.order_data && typeof leadData.order_data === "object" ? leadData.order_data : leadData
+    );
+    const resumedHistory = activeLead.conversation_id
+      ? (await getConversationHistoryForLead(activeLead.conversation_id, 24)).history
+      : [];
+
+    const row = {
+      messages: Array.isArray(resumedHistory) ? resumedHistory : [],
+      files: Array.isArray(seedOrder.files) ? seedOrder.files : [],
+      lang: leadData.lang || "ru",
+      flagShown: true,
+      serviceCode: normalizeServiceType(seedOrder.type) || null,
+      orderData: seedOrder,
+      upsellShown: true,
+      pendingFinalize: null,
+    };
+    ensureIntake(row);
+    row.intake.servicesQueue = [];
+    row.intake.idx = 0;
+    row.intake.perService = {};
+
+    setContext(chatId, row);
+    return row;
+  } catch (e) {
+    console.error("[hydrate]", e.message);
+    return null;
+  }
+}
+
+/**
+ * Режим relay после «Уточнить»: текст и голос клиенту как сообщение от менеджера;
+ * голос транскрибируется, текст перефразируется под клиента (без «скажи клиенту…»), пишется в историю.
+ * Остальное — copyMessage как раньше.
+ */
+async function tryManagerRelayForward(ctx) {
+  const rel = getManagerReplyMode(ctx.from.id);
+  if (!rel || !managerCommandAllowed(ctx)) return false;
+  try {
+    const lead = await getLeadById(rel.leadId);
+    if (!lead?.telegram_chat_id) {
+      await ctx.reply(`Лид #${rel.leadId} не найден или без chat_id клиента.`);
+      clearManagerReplyMode(ctx.from.id);
+      return true;
+    }
+    const to = String(lead.telegram_chat_id);
+    const cLang = lead.data?.lang || "ru";
+    const prefix = { ru: "Менеджер:", kk: "Менеджер:", en: "Manager:" }[cLang] || "Менеджер:";
+
+    let relayLogText = null;
+
+    if (ctx.message?.voice || ctx.message?.audio) {
+      await ctx.sendChatAction("recording_voice").catch(() => {});
+      let text = "";
+      try {
+        text = ((await transcribeVoice(ctx, cLang)) || "").trim();
+      } catch (e) {
+        console.error("[relay transcribe]", e.message);
+        await ctx.reply(
+          "Не удалось распознать голос. Запишите ещё раз или отправьте текстом."
+        );
+        return true;
+      }
+      if (!text) {
+        await ctx.reply(
+          "Распознавание пустое. Повторите голос короче/громче или напишите текстом."
+        );
+        return true;
+      }
+      await ctx.sendChatAction("typing").catch(() => {});
+      const polishedVoice = ((await polishRelayForClient(text, cLang)) || text).trim();
+      relayLogText = polishedVoice || text;
+      await _bot.telegram.sendMessage(to, `${prefix} ${relayLogText}`);
+    } else if (ctx.message?.text?.trim()) {
+      const rawText = ctx.message.text.trim();
+      await ctx.sendChatAction("typing").catch(() => {});
+      relayLogText = ((await polishRelayForClient(rawText, cLang)) || rawText).trim() || rawText;
+      await _bot.telegram.sendMessage(to, `${prefix} ${relayLogText}`);
+    } else {
+      const mid = ctx.message?.message_id;
+      if (mid) {
+        await ctx.telegram.copyMessage(to, ctx.chat.id, mid);
+      }
+      relayLogText =
+        (ctx.message?.caption && String(ctx.message.caption).trim()) ||
+        (ctx.message?.photo ? "[manager relay photo]" : null) ||
+        (ctx.message?.document ? `[manager relay: ${ctx.message.document.file_name || "document"}]` : null) ||
+        "[manager relay media]";
+    }
+
+    if (lead.conversation_id && relayLogText) {
+      await appendConversationMessage(lead.conversation_id, "manager", relayLogText);
+    }
+
+    clearManagerReplyMode(ctx.from.id);
+    await ctx.reply(`✓ Сообщение передано клиенту (лид #${rel.leadId}).`);
+  } catch (e) {
+    console.error("[relay]", e.message);
+    await ctx.reply(`Не удалось переслать: ${e.message}`);
+    clearManagerReplyMode(ctx.from.id);
+  }
+  return true;
+}
+
+// ─── /start, /help, /reset ───────────────────────────────────────────────────
+
+export async function handleStart(ctx) {
+  const chat = ctx.chat;
+  if ((chat?.type === "group" || chat?.type === "supergroup") && isManagerOperationsChat(ctx)) {
+    if (managerCommandAllowed(ctx)) {
+      await ctx.reply("Команды менеджера: /leads, /stats, /reply … Кнопки ниже — быстрый ввод команд.", {
+        reply_markup: getManagerLeadsKeyboardMarkup(),
+      });
+    }
+    return;
+  }
+  if (chat?.type === "private" && managerCommandAllowed(ctx) && hasManagerUserAllowlist()) {
+    await ctx.reply(
+      "Вы в списке менеджеров: intake в личке отключён. Лиды и ответы клиентам — через кнопки ниже или текстом: /leads, /stats, /reply …",
+      { reply_markup: getManagerLeadsKeyboardMarkup() }
+    );
+    return;
+  }
+
+  try {
+    const restored = await hydrateClientContextFromDb(chat.id);
+    if (
+      restored &&
+      Array.isArray(restored.messages) &&
+      restored.messages.length >= 2 &&
+      !restored.pendingFinalize
+    ) {
+      await ctx.reply(
+        `🏢 ${AGENCY_NAME} — жарнама агенттігі / рекламное агентство\n\n` +
+          "Сізде аяқталмаған тапсырыс бар — сол жерден жалғастырамыз.\n" +
+          "У вас уже есть незавершённый заказ — продолжим с того же места.\n\n" +
+          "Таза бастау үшін /reset жіберіңіз · Если нужно с чистого листа — отправьте /reset.\n\n" +
+          "Қысқаша жазыңыз немесе нақтылаңыз · Коротко допишите или уточните, что нужно."
+      );
+      return;
+    }
+  } catch { /* ignore */ }
+
+  clearContext(ctx.chat.id);
+  const welcomeBody = buildStartWelcomeBody();
+  const logoPath = resolveAgencyLogoPath();
+  if (logoPath) {
+    try {
+      const noLinkPreview = { link_preview_options: { is_disabled: true } };
+      await ctx.replyWithPhoto(
+        { source: fs.createReadStream(logoPath) },
+        { caption: buildStartPhotoCaption(), ...noLinkPreview }
+      );
+      await ctx.reply(welcomeBody, noLinkPreview);
+      return;
+    } catch (e) {
+      console.error("[start] logo send failed:", e.message);
+    }
+  }
+  await ctx.reply(buildStartWelcomeFallbackText(), { link_preview_options: { is_disabled: true } });
+}
+
+async function handleHelp(ctx) {
+  const mgr = isManagerOperationsChat(ctx) || (isClientPrivateChat(ctx) && managerCommandAllowed(ctx) && hasManagerUserAllowlist());
+  const lines = [
+    `🏢 ${AGENCY_NAME} — рекламное агентство`,
+    "",
+    "📖 Команды",
+    "",
+    "/start — начать новый заказ",
+    "/reset — сбросить текущий диалог",
+    "/help — помощь",
+    "/templates — шаблоны типовых заказов (кнопки)",
+    "",
+    "Можно писать текстом, наговаривать голосом или присылать макеты (в т.ч. PDF — бот вытащит текст, если он в слое).",
+  ];
+  if (mgr) {
+    lines.push("", "Менеджер: /stats — сводка по диалогам и заказам в БД.");
+    lines.push("/transcript <id лида> — полный лог переписки из БД (в т.ч. текст после голоса).");
+    lines.push("/transcript chat <telegram_chat_id> — последняя беседа по chat id клиента.");
+    lines.push("", "Кнопки снизу — быстрый ввод /leads …");
+  }
+  await ctx.reply(lines.join("\n"), mgr ? { reply_markup: getManagerLeadsKeyboardMarkup() } : undefined);
+}
+
+async function handleReset(ctx) {
+  clearContext(ctx.chat.id);
+  clearManagerReplyMode(ctx.from.id);
+  if (String(ctx.chat?.id) === getManagerChatId()) clearManagerState(ctx.chat.id);
+  if (isClientPrivateChat(ctx))
+    upsertConversation({
+      telegramUserId: ctx.from.id,
+      telegramChatId: ctx.chat.id,
+      history: [],
+      files: [],
+      lang: null,
+      status: "active",
+      metadata: { order: null, intake_state: { servicesQueue: [], idx: 0, perService: {} }, pending_finalize: null },
+    }).catch(() => {});
+  await ctx.reply(buildResetWelcomeText());
+}
+
+// ─── Text / Voice / Files ────────────────────────────────────────────────────
+
+async function maybeResolvePendingBrief(ctx, userMessage) {
+  if (!isClientPrivateChat(ctx)) return false;
+
+  let entry = getContext(ctx.chat.id);
+  if (!entry) {
+    await hydrateClientContextFromDb(ctx.chat.id).catch(() => {});
+    entry = getContext(ctx.chat.id);
+  }
+  const pf = entry?.pendingFinalize;
+  if (!pf || typeof pf !== "object") return false;
+
+  const lang = entry.lang || "ru";
+
+  if (!isAffirmative(lang, userMessage)) {
+    entry.pendingFinalize = null;
+    setContext(ctx.chat.id, entry);
+    upsertConversation({
+      telegramUserId: ctx.from.id,
+      telegramChatId: ctx.chat.id,
+      history: entry.messages,
+      files: entry.files,
+      lang,
+      status: "active",
+      metadata: intakeMetadata(entry),
+      lastUserMessageAt: new Date().toISOString(),
+    }).catch(() => {});
+    return false;
+  }
+
+  entry.messages = [...(entry.messages || []), { role: "user", content: userMessage }];
+  entry.pendingFinalize = null;
+  setContext(ctx.chat.id, entry);
+  await finalizeOrder(ctx, entry, pf.args || {}, pf.finalizeOpts || {});
+  return true;
+}
+
+export async function handleText(ctx) {
+  const userMessage = ctx.message.text?.trim();
+  if (!userMessage) return;
+
+  const chat = ctx.chat;
+  const inMgrGroup =
+    (chat?.type === "group" || chat?.type === "supergroup") && isManagerOperationsChat(ctx);
+
+  if (inMgrGroup) {
+    if (await maybeHandleManagerCalculate(ctx, userMessage)) return;
+    if (await maybeHandleManagerTeachInput(ctx, userMessage, "text")) return;
+    const pc = pendingClarify.get(getManagerChatId());
+    const replyToId = ctx.message?.reply_to_message?.message_id;
+    if (pc && replyToId && replyToId === pc.promptMessageId) {
+      pendingClarify.delete(getManagerChatId());
+      await sendManagerReplyToClient(ctx, pc.leadId, userMessage);
+      return;
+    }
+    const pe = pendingProposalEdit.get(getManagerChatId());
+    const replyToId2 = ctx.message?.reply_to_message?.message_id;
+    if (pe && replyToId2 && replyToId2 === pe.promptMessageId) {
+      pendingProposalEdit.delete(getManagerChatId());
+      await sendManagerProposalToClient(ctx, pe.leadId, userMessage);
+      return;
+    }
+    if (await tryManagerRelayForward(ctx)) return;
+    return;
+  }
+
+  if (isClientPrivateChat(ctx) && managerCommandAllowed(ctx) && hasManagerUserAllowlist()) {
+    if (await maybeHandleManagerCalculate(ctx, userMessage)) return;
+    if (await maybeHandleManagerTeachInput(ctx, userMessage, "text")) return;
+    if (await tryManagerRelayForward(ctx)) return;
+    await ctx.reply(
+      "Вы менеджер — сбор заказов в этом чате отключён. После «Уточнить» пришлите одно сообщение для клиента, либо /leads, /reply …"
+    );
+    return;
+  }
+
+  if (await maybeHandleManagerCalculate(ctx, userMessage)) return;
+  if (await maybeHandleManagerTeachInput(ctx, userMessage, "text")) return;
+
+  if (!getContext(ctx.chat.id)) await hydrateClientContextFromDb(ctx.chat.id).catch(() => {});
+
+  if (await maybeResolvePendingBrief(ctx, userMessage)) return;
+
+  await processUserMessage(ctx, userMessage);
+}
+
+export async function handleVoice(ctx) {
+  try {
+    const chat = ctx.chat;
+    const inMgrGroup =
+      (chat?.type === "group" || chat?.type === "supergroup") && isManagerOperationsChat(ctx);
+    const privMgr =
+      isClientPrivateChat(ctx) && managerCommandAllowed(ctx) && hasManagerUserAllowlist();
+
+    if (inMgrGroup || privMgr) {
+      if (await tryManagerRelayForward(ctx)) return;
+    }
+
+    const teachAwait =
+      inMgrGroup &&
+      managerCommandAllowed(ctx) &&
+      getManagerState(ctx.chat.id)?.state === "awaiting_teach_input";
+    if (inMgrGroup && managerCommandAllowed(ctx) && !getManagerReplyMode(ctx.from.id) && !teachAwait) {
+      await ctx
+        .reply(
+          "Голос клиенту не отправлен: сначала нажмите «💬 Уточнить» по этому лиду в этом чате, " +
+            "затем в течение 15 минут пришлите одно сообщение (голос или текст) — оно уйдёт клиенту. " +
+            "Или текстом: /reply <ID> <сообщение>."
+        )
+        .catch(() => {});
+      return;
+    }
+    if (privMgr && managerCommandAllowed(ctx) && !getManagerReplyMode(ctx.from.id)) {
+      await ctx
+        .reply(
+          "Голос клиенту: сначала в рабочем чате менеджеров нажмите «💬 Уточнить» по нужному лиду " +
+            "(режим ~15 минут, тот же ваш аккаунт), затем пришлите голос сюда в личку бота или в группу. " +
+            "Или отправьте текстом: /reply <ID> <текст>."
+        )
+        .catch(() => {});
+      return;
+    }
+
+    await ctx.sendChatAction("typing");
+    const existing = getContext(ctx.chat.id);
+    const text = await transcribeVoice(ctx, existing?.lang);
+    if (!text) {
+      await ctx.reply("Не получилось распознать голос, попробуйте ещё раз или напишите текстом.");
+      return;
+    }
+
+    if (inMgrGroup) {
+      if (await maybeHandleManagerCalculate(ctx, text)) return;
+      if (await maybeHandleManagerTeachInput(ctx, text, "voice")) return;
+      return;
+    }
+
+    if (privMgr) {
+      if (await maybeHandleManagerCalculate(ctx, text)) return;
+      if (await maybeHandleManagerTeachInput(ctx, text, "voice")) return;
+      await ctx.reply(
+        "Голос здесь не уходит клиенту автоматически. Нажмите «💬 Уточнить» по лиду в рабочем чате, затем пришлите голос, " +
+          "или используйте /reply <ID> <текст>."
+      );
+      return;
+    }
+
+    if (!getContext(ctx.chat.id)) await hydrateClientContextFromDb(ctx.chat.id).catch(() => {});
+
+    if (await maybeResolvePendingBrief(ctx, text)) return;
+
+    await processUserMessage(ctx, text);
+  } catch (err) {
+    console.error("Voice error:", err.message);
+    await ctx.reply("Не получилось обработать голос. Напишите текстом, пожалуйста.");
+  }
+}
+
+export async function handleFile(ctx) {
+  try {
+    const chat = ctx.chat;
+    const inMgrGroup =
+      (chat?.type === "group" || chat?.type === "supergroup") && isManagerOperationsChat(ctx);
+    const privMgr =
+      isClientPrivateChat(ctx) && managerCommandAllowed(ctx) && hasManagerUserAllowlist();
+
+    if (inMgrGroup || privMgr) {
+      if (await tryManagerRelayForward(ctx)) return;
+    }
+
+    // /teach: документ в рабочем чате менеджеров (PDF / текст)
+    if (inMgrGroup && managerCommandAllowed(ctx) && ctx.message.document) {
+      const ms = getManagerState(ctx.chat.id);
+      if (ms?.state === "awaiting_teach_input") {
+        const doc = ctx.message.document;
+        const mimeStr = (doc.mime_type || "").toLowerCase();
+        const fname = (doc.file_name || "").toLowerCase();
+        const isImg = mimeStr.startsWith("image/");
+        if (!isImg) {
+          const isPdf = mimeStr === "application/pdf" || fname.endsWith(".pdf");
+          const isTextish =
+            mimeStr === "text/plain" ||
+            mimeStr === "text/markdown" ||
+            mimeStr.startsWith("text/") ||
+            /\.(txt|md|csv)$/i.test(fname);
+          if (isPdf || isTextish) {
+            await ctx.sendChatAction("typing").catch(() => {});
+            try {
+              const link = await ctx.telegram.getFileLink(doc.file_id);
+              const resp = await fetch(link.href);
+              if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+              const buf = Buffer.from(await resp.arrayBuffer());
+              let raw = "";
+              if (isPdf) raw = await extractTextFromPdfBuffer(buf);
+              else raw = buf.toString("utf8");
+              const extracted = (raw || "").trim();
+              if (!extracted) {
+                await ctx
+                  .reply("Не удалось извлечь текст из файла (пусто или скан без текстового слоя).")
+                  .catch(() => {});
+                return;
+              }
+              if (await maybeHandleManagerTeachInput(ctx, extracted.slice(0, 12000), "file")) return;
+            } catch (e) {
+              console.error("[teach file]", e.message);
+              await ctx.reply(`Не удалось прочитать файл: ${e.message}`).catch(() => {});
+              return;
+            }
+          } else {
+            await ctx
+              .reply("Для /teach поддерживаются PDF и текстовые файлы (.txt, .md, .csv).")
+              .catch(() => {});
+            return;
+          }
+        }
+      }
+    }
+
+    if (inMgrGroup) return;
+    if (privMgr) {
+      await ctx.reply("Файлы к заявке не через этот чат — операторский канал используйте «Уточнить» или /reply.");
+      return;
+    }
+
+    if (!getContext(ctx.chat.id)) await hydrateClientContextFromDb(ctx.chat.id).catch(() => {});
+
+    let fileId, label, isImage = false, mime = null;
+    if (ctx.message.photo) {
+      const photos = ctx.message.photo;
+      fileId = photos[photos.length - 1].file_id;
+      label = "фото";
+      isImage = true;
+      mime = "image/jpeg";
+    } else if (ctx.message.document) {
+      fileId = ctx.message.document.file_id;
+      label = ctx.message.document.file_name || "документ";
+      mime = ctx.message.document.mime_type || null;
+      if (mime && mime.startsWith("image/")) isImage = true;
+    } else {
+      return;
+    }
+
+    const link = await ctx.telegram.getFileLink(fileId);
+    addFile(ctx.chat.id, link.href);
+
+    const caption = ctx.message.caption?.trim();
+    let existing = getContext(ctx.chat.id);
+    let lang = existing?.lang || "ru";
+    let activeLead = null;
+    try {
+      activeLead = await getActiveLeadByChatId(ctx.chat.id);
+    } catch (err) {
+      console.warn("[file activeLead]", err.message);
+    }
+
+    if (activeLead && shouldBypassClientFileAnalysis(existing)) {
+      const managerChatId = getManagerChatId();
+      const leadId = activeLead.id;
+      const managerNote = [
+        `📎 Клиент прислал файл по лиду #${leadId}.`,
+        caption ? `Подпись клиента: ${caption}` : null,
+      ]
+        .filter(Boolean)
+        .join("\n");
+      await ctx.telegram.sendMessage(managerChatId, managerNote).catch(() => {});
+      await ctx.telegram.copyMessage(managerChatId, ctx.chat.id, ctx.message.message_id).catch(() => {});
+      if (activeLead.conversation_id) {
+        const logText = caption
+          ? `[файл отправлен менеджеру по запросу] ${caption}`
+          : "[файл отправлен менеджеру по запросу менеджера]";
+        await appendConversationMessage(activeLead.conversation_id, "user", logText);
+      }
+      const passAck = {
+        ru: "Приняла, передала файл менеджеру.",
+        kk: "Қабылдадым, файлды менеджерге жібердім.",
+        en: "Got it, I forwarded the file to the manager.",
+      };
+      await ctx.reply(passAck[lang] || passAck.ru);
+      return;
+    }
+
+    const lowerName = (label || "").toLowerCase();
+    const mimeStr = (mime || "").toLowerCase();
+    const isPdf = mimeStr === "application/pdf" || lowerName.endsWith(".pdf");
+    const isPsdAi =
+      /\.(psd|ai|eps)$/i.test(lowerName) ||
+      mimeStr.includes("postscript") ||
+      mimeStr === "image/vnd.adobe.photoshop";
+
+    let pdfText = "";
+    if (ctx.message.document && isPdf && !isImage) {
+      try {
+        await ctx.sendChatAction("typing");
+        const resp = await fetch(link.href);
+        if (resp.ok) {
+          const buf = Buffer.from(await resp.arrayBuffer());
+          pdfText = await extractTextFromPdfBuffer(buf);
+        }
+      } catch (err) {
+        console.error("PDF extract:", err.message);
+      }
+    }
+
+    // Подмешиваем файл в формальный orderData: files += url;
+    // design = "есть макет" если ещё не задан явно.
+    if (existing) {
+      const cur = existing.orderData || makeEmptyOrder();
+      const fileDelta = { files: [link.href] };
+      if (!cur.design) fileDelta.design = "есть макет";
+      existing.orderData = mergeData(cur, fileDelta);
+      setContext(ctx.chat.id, existing);
+      console.log(`[orderData/file] chat=${ctx.chat.id} files=${existing.orderData.files.length} design=${existing.orderData.design}`);
+    }
+
+    let vision = null;
+    let imageIntent = "";
+    if (isImage) {
+      try {
+        await ctx.sendChatAction("typing");
+        const dataUrl = await fetchAsDataUrl(link.href, mime || "image/jpeg");
+
+        try {
+          const cls = await classifyImageForIntake(dataUrl, lang);
+          const kind = cls?.kind || "unclear";
+          imageIntent = ` | image_kind: "${kind}"`;
+          if (kind === "casual_photo") {
+            const casualMsg = {
+              ru: "Похоже на обычное фото, не чертёж. Хотите опереться на него как на референс или лучше прислать отдельно логотип/готовый макет?",
+              kk: "Кәделігі фото сияқты көрінеді. Оны негіз ретінде пайдаланамыз ба әлде логотип/макетті бөлек жіберіп тұрған жөн бе?",
+              en: "This looks like a casual photo rather than artwork. Want to use it as a loose reference—or send a proper logo/mockup?",
+            };
+            await ctx.reply(casualMsg[lang] || casualMsg.ru).catch(() => {});
+          }
+        } catch (e) {
+          console.warn("[cls image]", e.message);
+        }
+
+        vision = await describeImage(dataUrl, lang);
+      } catch (err) {
+        console.error("Vision fetch/describe error:", err.message);
+      }
+    }
+
+    const visionPart = vision ? ` | vision: "${vision.replace(/"/g, "'")}"` : "";
+    let pdfPart = "";
+    if (pdfText) {
+      pdfPart = ` | pdf_excerpt: "${pdfText.slice(0, 4000).replace(/"/g, "'")}"`;
+    } else if (isPdf && !isImage) {
+      pdfPart = ` | pdf_text_empty: yes (скан или графический PDF без слоя текста)`;
+      await ctx
+        .reply(
+          "Этот PDF без текстового слоя (часто так у сканов). Если можно — пара строк текстом или фото того, что напечатать."
+        )
+        .catch(() => {});
+    } else if (isPsdAi) {
+      pdfPart = " | note: \"PSD/AI/EPS — автоматический разбор недоступен; файл в заявке\"";
+    }
+    const systemNote =
+      `[файл прикреплён: ${link.href}${visionPart}${imageIntent}${pdfPart}` +
+      (caption ? ` | подпись: ${caption}` : "");
+
+    const message = caption ? `${caption}\n\n${systemNote}` : systemNote;
+    const ack = {
+      ru: label === "фото" ? "Увидела картинку, учитываю её в описании заказа." : "Файл получила, уже в вашей заявке.",
+      kk: label === "фото" ? "Суретті көрдім, тапсырыста ескере аламын." : "Файл қабылдадым.",
+      en: label === "фото" ? "Got the image — I’ll fold it into the brief." : "File received and attached.",
+    };
+    await ctx.reply(ack[lang] || ack.ru);
+    await processUserMessage(ctx, message);
+  } catch (err) {
+    console.error("File error:", err.message);
+    await ctx.reply("Не получилось загрузить файл. Попробуйте ещё раз 🙏");
+  }
+}
+
+async function fetchAsDataUrl(url, mime = "image/jpeg") {
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error(`Download failed: ${resp.status}`);
+  const buf = Buffer.from(await resp.arrayBuffer());
+  return `data:${mime};base64,${buf.toString("base64")}`;
+}
+
+// ─── Service-type classifier (kw match → LLM fallback) ───────────────────────
+
+async function resolveServiceCode({ collected, allMessagesText }) {
+  // 1) Если LLM уже извлёк service_type — нормализуем по ключевым словам.
+  if (collected && collected.service_type) {
+    const k = keywordClassify(collected.service_type) || normalizeServiceType(collected.service_type);
+    if (k) return k;
+  }
+  // 2) Keyword-match на полном тексте диалога (быстро, бесплатно).
+  const kw = keywordClassify(allMessagesText);
+  if (kw) return kw;
+  // 3) LLM fallback (gpt-4o-mini, дёшево). Может вернуть null — тогда останется не определён.
+  try {
+    const llm = await classifyServiceTypeLLM(allMessagesText);
+    if (llm) return llm;
+  } catch (err) {
+    console.error("classifyServiceTypeLLM threw:", err.message);
+  }
+  return null;
+}
+
+// ─── Reply helpers ───────────────────────────────────────────────────────────
+
+function splitReply(text) {
+  if (!text) return [];
+  const idx = text.indexOf("||");
+  if (idx === -1) return [text.trim()];
+  const reaction = text.substring(0, idx).trim();
+  const main = text.substring(idx + 2).trim();
+  if (!reaction) return [main];
+  if (!main) return [reaction];
+  return [reaction, main];
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function isValidContact(contact) {
+  if (!contact) return false;
+  const c = String(contact).trim();
+  if (c.length < 5) return false;
+  return /\d/.test(c) || c.includes("@") || c.includes(".");
+}
+
+function isPlaceholderContact(contact) {
+  if (!contact) return false;
+  const c = String(contact).toLowerCase().trim();
+  return /^(этот|тут|здесь|сюда|telegram|тг|телег|осында|осы жерде|here|in telegram|telegram-да)\b/.test(c)
+      || c === "telegram"
+      || c === "telegram-да"
+      || c === "осы telegram"
+      || c === "this telegram";
+}
+
+function isManagerAskingForAsset(text) {
+  const t = String(text || "").toLowerCase();
+  if (!t) return false;
+  const hasAction = /(пришл|отправ|скинь|прикреп|попрос|attach|send|upload|share)/i.test(t);
+  const hasAsset = /(логотип|logo|макет|mockup|файл|file|документ|document|картин|image|изображ)/i.test(t);
+  return hasAction && hasAsset;
+}
+
+function shouldBypassClientFileAnalysis(existing) {
+  if (!existing || !Array.isArray(existing.messages) || existing.messages.length === 0) return false;
+  const msgs = existing.messages;
+  let managerIdx = -1;
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    if (msgs[i]?.role === "manager") {
+      managerIdx = i;
+      break;
+    }
+  }
+  if (managerIdx < 0) return false;
+  if (!isManagerAskingForAsset(msgs[managerIdx]?.content || "")) return false;
+  for (let i = managerIdx + 1; i < msgs.length; i++) {
+    const m = msgs[i];
+    if (m?.role !== "user") continue;
+    const txt = String(m.content || "");
+    if (!txt || txt.startsWith("[файл прикреплён:")) continue;
+    return false;
+  }
+  return true;
+}
+
+// ─── Core LLM loop ───────────────────────────────────────────────────────────
+
+async function processUserMessage(ctx, userMessage) {
+  const chatId = ctx.chat.id;
+  const userId = ctx.from.id;
+
+  let entry = getContext(chatId) || {
+    messages: [],
+    files: [],
+    lang: null,
+    flagShown: false,
+    serviceCode: null,
+    orderData: makeEmptyOrder(),
+    upsellShown: false,
+  };
+  if (!entry.orderData) entry.orderData = makeEmptyOrder();
+  if (typeof entry.upsellShown !== "boolean") entry.upsellShown = false;
+  entry.messages = [...entry.messages, { role: "user", content: userMessage }];
+
+  const intake = ensureIntake(entry);
+  const nonFileUserMsgs = entry.messages.filter(
+    (m) => m.role === "user" && !String(m.content || "").startsWith("[файл прикреплён:")
+  ).length;
+  if (nonFileUserMsgs <= 3 && intake.servicesQueue.length === 0 && !entry.pendingFinalize) {
+    const rawQ = extractServicesQueueFromText(userMessage.replace(/\[файл прикреплён:[\s\S]*/gi, ""));
+    if (rawQ.length >= 2) {
+      intake.servicesQueue = rawQ;
+      intake.idx = 0;
+      intake.perService = {};
+      entry.serviceCode = rawQ[0];
+      entry.orderData.type = rawQ[0];
+    }
+  }
+
+  // Detect language
+  const isFileNote = /^\[файл прикреплён:/.test(userMessage);
+  let lang = entry.lang;
+  if (!isFileNote) {
+    try {
+      const detected = await detectLang(userMessage);
+      if (!entry.lang || entry.lang !== detected) {
+        entry.lang = detected;
+        entry.flagShown = false;
+      }
+      lang = entry.lang;
+    } catch (err) {
+      console.error("detectLang error:", err.message);
+    }
+  }
+  if (!lang) lang = "ru";
+  entry.lang = lang;
+  setContext(chatId, entry);
+  setLang(chatId, lang);
+
+  try {
+    await ctx.sendChatAction("typing");
+
+    // ─── Extract partial brief + classify service type ─────────────────────
+    let collected = {};
+    let currentStep = null;
+    let currentQuestion = null;
+    let serviceCode = entry.serviceCode || null;
+
+    if (entry.messages.length >= 2) {
+      try {
+        collected = await extractPartialBrief(entry.messages);
+      } catch (err) {
+        console.error("extractPartialBrief threw:", err.message);
+      }
+      // Если есть прикреплённые файлы — design = "есть макет".
+      if ((entry.files || []).length > 0 && !collected.design) {
+        collected.design = "есть макет";
+      }
+
+      // ─── Formal structured extraction (extractData → mergeData) ─────
+      console.log(`[processUserMessage] chat=${chatId} userMessage=`, JSON.stringify(String(userMessage).slice(0, 200)));
+      try {
+        const delta = await extractData(userMessage, entry.orderData, lang);
+        const before = entry.orderData;
+        entry.orderData = mergeData(entry.orderData, delta);
+        console.log(`[orderData] chat=${chatId} merged=`, JSON.stringify(entry.orderData));
+        // Подмешиваем legacy-collected (LLM-вызов выше) — нормализуем и сольём.
+        const collectedNormalized = normalizeToSchema(collected);
+        entry.orderData = mergeData(entry.orderData, collectedNormalized);
+      } catch (err) {
+        console.error("extractData/mergeData failed:", err.message);
+      }
+
+      // Classify / re-classify
+      const userText = entry.messages
+        .filter((m) => m.role === "user")
+        .map((m) => m.content || "")
+        .join(" ")
+        .slice(0, 4000);
+      const newCode = await resolveServiceCode({ collected, allMessagesText: userText });
+
+      if (newCode && newCode !== serviceCode) {
+        if (serviceCode) {
+          // Сменился тип — переносим общие поля, остальное обнуляем (LLM соберёт заново).
+          const carry = carryOverFields(collected);
+          collected = { ...carry };
+        }
+        serviceCode = newCode;
+      }
+      entry.serviceCode = serviceCode;
+      if (intake.servicesQueue.length) {
+        const forced = intake.servicesQueue[intake.idx];
+        if (forced) {
+          serviceCode = forced;
+          entry.serviceCode = forced;
+        }
+      }
+
+      // Перезатираем service_type в collected на нормализованный код,
+      // чтобы UI/save_order писали единообразно ("вывеска" / "баннер" / ...).
+      if (serviceCode) collected.service_type = serviceCode;
+
+      currentStep = nextStepFor(collected, serviceCode);
+      currentQuestion = getQuestion(lang, currentStep);
+    }
+
+    setContext(chatId, entry);
+
+    const lastMsgs = entry.messages.slice(-10);
+
+    // RAG-lite: подмешиваем релевантные записи knowledge_base в system prompt.
+    // Дёшево: один Supabase-запрос (full-text + tags fallback). Если 0 — "" и flow без изменений.
+    let knowledgeContext = "";
+    try {
+      knowledgeContext = await buildKnowledgeContext({
+        lastUserMessage: userMessage,
+        orderData: entry.orderData,
+        lang,
+      });
+      if (knowledgeContext) {
+        console.log(
+          `[knowledgeContext] chat=${chatId} added ${knowledgeContext.split("\n").length} lines`
+        );
+      }
+    } catch (err) {
+      console.error("buildKnowledgeContext failed:", err.message);
+    }
+
+    // ─── Upsell / cross-sell trigger ────────────────────────────
+    // Один раз за диалог, после того как тип услуги определён и
+    // собрано минимум 2 поля сценария — мягко предлагаем доп.услуги.
+    let upsellPromptBlock = "";
+    let upsellAboutToShow = false;
+    try {
+      const scenarioSteps = serviceCode ? (SCENARIOS[serviceCode] || []) : [];
+      upsellAboutToShow = shouldTriggerUpsell({
+        serviceCode,
+        orderData: entry.orderData,
+        upsellShown: entry.upsellShown,
+        scenarioSteps,
+        currentStep,
+      });
+      if (upsellAboutToShow) {
+        upsellPromptBlock = buildUpsellPromptBlock(serviceCode, lang) || "";
+        console.log(`[upsell] chat=${chatId} trigger service=${serviceCode} step=${currentStep}`);
+      }
+    } catch (err) {
+      console.error("upsell trigger failed:", err.message);
+    }
+
+    const result = await chat(lastMsgs, lang, {
+      collected,
+      currentStep,
+      serviceCode,
+      currentQuestion,
+      knowledgeContext,
+      upsellPromptBlock,
+    });
+
+    if (result.type === "function") {
+      if (result.args && serviceCode) {
+        const norm = normalizeServiceType(result.args.service_type) || serviceCode;
+        result.args.service_type = norm;
+      }
+      const stopped = await interceptSaveOrderIntent(
+        ctx,
+        entry,
+        chatId,
+        userId,
+        lang,
+        result.args || {},
+        serviceCode
+      );
+      if (stopped) return;
+    }
+
+    let reply = result.content || "...";
+
+    // Если в этой реплике мы попросили LLM произнести upsell — фиксируем флаг.
+    if (upsellAboutToShow) {
+      entry.upsellShown = true;
+    }
+
+    const meta = getLangMeta(lang);
+    const flagShown = consumeFlag(chatId);
+
+    const parts = splitReply(reply);
+
+    entry.messages = [...entry.messages, { role: "assistant", content: parts.join(" ") }];
+    setContext(chatId, entry);
+
+    upsertConversation({
+      telegramUserId: userId,
+      telegramChatId: chatId,
+      history: entry.messages,
+      files: entry.files,
+      lang,
+      status: "active",
+      metadata: intakeMetadata(entry),
+      lastUserMessageAt: new Date().toISOString(),
+    }).catch((err) => console.error("Conversation upsert failed:", err.message));
+
+    if (parts.length === 2) {
+      const first = parts[0];
+      await ctx.reply(first);
+      await sleep(420);
+      await ctx.sendChatAction("typing").catch(() => {});
+      await sleep(80);
+      await ctx.reply(parts[1]);
+    } else {
+      const single = parts[0];
+      await ctx.reply(single);
+    }
+  } catch (err) {
+    console.error("LLM error:", err.message);
+    await ctx.reply("Что-то пошло не так на моей стороне. Попробуйте ещё раз через минуту 🙏");
+  }
+}
+
+// ─── Finalize ────────────────────────────────────────────────────────────────
+
+function buildTelegramFallbackContact(ctx) {
+  const u = ctx.from?.username;
+  if (u) return `@${u}`;
+  const id = ctx.from?.id;
+  if (id) return `tg://user?id=${id}`;
+  return null;
+}
+
+/** Аргументы save_order после объединения нескольких услуг. */
+function buildComboArgsFromSnapshots(toolArgs, snapshots) {
+  if (!snapshots?.length) return { ...(toolArgs || {}) };
+  const primary = snapshots[0];
+  const last = snapshots[snapshots.length - 1];
+  const multi = snapshots.length > 1;
+  return {
+    ...primary,
+    ...(toolArgs || {}),
+    service_type: multi ? "другое" : primary.service_type || primary.type || toolArgs?.service_type,
+    description: multi
+      ? snapshots
+          .map(
+            (s) =>
+              `${s.service_type || s.type || "—"}: ${s.description || s.content || "—"}`.trim()
+          )
+          .join(" · ")
+      : toolArgs?.description || primary.description || primary.content,
+    deadline: last.deadline || toolArgs?.deadline || primary.deadline,
+    contact: last.contact || toolArgs?.contact || primary.contact,
+    multi_services: snapshots,
+  };
+}
+
+function mergeSnapshotsOrderData(snaps) {
+  if (!snaps?.length) return makeEmptyOrder();
+  let acc = makeEmptyOrder();
+  for (const s of snaps) {
+    acc = mergeData(acc, mergeData(makeEmptyOrder(), normalizeToSchema(s)));
+  }
+  acc.multi_services = snaps;
+  acc.description = snaps
+    .map((s) => `${s.service_type || s.type}: ${s.description || s.content || ""}`.trim())
+    .join(" · ");
+  acc.type =
+    snaps.length > 1 ? "другое" : (snaps[0].service_type || snaps[0].type || acc.type);
+  return acc;
+}
+
+/** Для валидации перед сохранением: берём обязательные поля с любой позиции мультизаказа. */
+function crossFieldsForMultiFinalize(snaps, od, args) {
+  const pick = (getter) => {
+    for (let i = snaps.length - 1; i >= 0; i--) {
+      const v = getter(snaps[i]);
+      if (v != null && String(v).trim()) return v;
+    }
+    return null;
+  };
+  return {
+    type: od.type || args.service_type || (snaps.length > 1 ? "другое" : pick((s) => s.type || s.service_type)),
+    size: od.size || args.size || pick((s) => s.size),
+    deadline: od.deadline || args.deadline || pick((s) => s.deadline),
+    contact: od.contact || args.contact || pick((s) => s.contact),
+  };
+}
+
+/**
+ * После вызова save_order у LLM: валидация, мультислоты, показ финального брифа клиенту (без лида до «да»).
+ */
+async function interceptSaveOrderIntent(
+  ctx,
+  entry,
+  chatId,
+  userId,
+  lang,
+  rawArgs,
+  serviceCodeFromCtx
+) {
+  const intake = ensureIntake(entry);
+  const args = { ...(rawArgs || {}) };
+
+  if (serviceCodeFromCtx) {
+    args.service_type = normalizeServiceType(args.service_type) || serviceCodeFromCtx;
+  }
+
+  const mergedFlat = snapshotForService(entry.orderData, args);
+  const curCode =
+    normalizeServiceType(args.service_type) || entry.serviceCode || mergedFlat.type || "другое";
+
+  const merged = { ...mergedFlat, type: mergedFlat.type || curCode };
+
+  const cross = {
+    type: merged.type || curCode,
+    size: merged.size || args.size,
+    deadline: merged.deadline || args.deadline,
+    contact: merged.contact || args.contact,
+  };
+
+  const missing = missingRequiredFields(cross, REQUIRED_FIELDS);
+  const missingNoContact = missing.filter((f) => f !== "contact");
+  if (missingNoContact.length > 0) {
+    const first = missingNoContact[0];
+    const stepKey = first === "type" ? "service_type" : first;
+    const q = getQuestion(lang, stepKey) || getQuestion(lang, "service_type");
+    if (q) await ctx.reply(q);
+    return true;
+  }
+
+  let contact = args.contact;
+  const fallback = buildTelegramFallbackContact(ctx);
+  if (isPlaceholderContact(contact) || (!contact && fallback)) {
+    contact = fallback || contact;
+  }
+  args.contact = contact;
+  merged.contact = contact;
+
+  if (!isValidContact(contact)) {
+    if (fallback && !contact) args.contact = fallback;
+    contact = args.contact;
+  }
+  if (!isValidContact(contact)) {
+    await ctx.reply(CONTACT_REASK[lang] || CONTACT_REASK.ru);
+    return true;
+  }
+
+  /** Клиент уже ответил «да» текстом после брифа от LLM — не дублируем программный бриф, сразу в лид. */
+  const last = entry.messages[entry.messages.length - 1];
+  const userJustAffirmed =
+    last?.role === "user" && isAffirmative(lang, String(last.content || "").trim());
+
+  if (userJustAffirmed && intake.servicesQueue.length >= 2) {
+    tryCollapseSpuriousOtherPlusServiceQueue(intake, [
+      curCode,
+      entry.serviceCode,
+      merged.type,
+      merged.service_type,
+      args.service_type,
+    ]);
+  }
+
+  const queue = intake.servicesQueue;
+
+  if (userJustAffirmed && queue.length < 2) {
+    const singleSnap = {
+      ...merged,
+      type: curCode,
+      service_type: curCode,
+      contact: args.contact,
+    };
+    const comboArgs = buildComboArgsFromSnapshots(args, [singleSnap]);
+    await finalizeOrder(ctx, entry, comboArgs, { multiServiceSnapshots: [singleSnap] });
+    return true;
+  }
+
+  const persistAfter = async (briefTextLine) => {
+    setContext(chatId, entry);
+    await ctx.reply(briefTextLine).catch(() => {});
+    upsertConversation({
+      telegramUserId: userId,
+      telegramChatId: chatId,
+      history: entry.messages,
+      files: entry.files,
+      lang,
+      status: "active",
+      metadata: intakeMetadata(entry),
+      lastUserMessageAt: new Date().toISOString(),
+    }).catch((e) => console.error("[upsert]", e.message));
+  };
+
+  if (queue.length >= 2) {
+    const slotKey = queue[intake.idx] || curCode;
+    const slotSnap = {
+      ...merged,
+      type: slotKey,
+      service_type: slotKey,
+      contact: args.contact,
+    };
+    intake.perService[slotKey] = slotSnap;
+
+    if (intake.idx < queue.length - 1) {
+      intake.idx += 1;
+      const nextCode = queue[intake.idx];
+      entry.serviceCode = nextCode;
+      entry.orderData = resetServiceSlotFields(orderCarryForward(slotSnap));
+      entry.orderData.type = nextCode;
+      const trRu = `Одну позицию («${slotKey}») сохранила — перехожу к «${nextCode}». По ней начнём с объёма или с того, что на печати?`;
+      const tr = {
+        ru: trRu,
+        kk: `Бір бөлікті («${slotKey}») жаздым — келесі «${nextCode}»: көлем ме, өлшем ме, немесе басылымда не болуы керек?`,
+        en: `Saved «${slotKey}». Now «${nextCode}» — start with qty/size or artwork?`,
+      }[lang] || trRu;
+      entry.messages = [...entry.messages, { role: "assistant", content: tr }];
+      setContext(chatId, entry);
+      await ctx.reply(tr);
+      upsertConversation({
+        telegramUserId: userId,
+        telegramChatId: chatId,
+        history: entry.messages,
+        files: entry.files,
+        lang,
+        status: "active",
+        metadata: intakeMetadata(entry),
+        lastUserMessageAt: new Date().toISOString(),
+      }).catch((e) => console.error("[upsert]", e.message));
+      return true;
+    }
+
+    const snapshots = queue.map((code) => ({
+      ...(intake.perService[code] || {}),
+      type: code,
+      service_type: code,
+    }));
+
+    const comboArgs = buildComboArgsFromSnapshots(args, snapshots);
+    /** Не просим третье «да» сводным брифом — лиды сразу после последней услуги. */
+    entry.pendingFinalize = null;
+    setContext(chatId, entry);
+    upsertConversation({
+      telegramUserId: userId,
+      telegramChatId: chatId,
+      history: entry.messages,
+      files: entry.files,
+      lang,
+      status: "active",
+      metadata: intakeMetadata(entry),
+      lastUserMessageAt: new Date().toISOString(),
+    }).catch((e) => console.error("[upsert]", e.message));
+    await finalizeOrder(ctx, entry, comboArgs, { multiServiceSnapshots: snapshots });
+    return true;
+  }
+
+  const singleSnap = {
+    ...merged,
+    type: curCode,
+    service_type: curCode,
+    contact: args.contact,
+  };
+  const comboArgs = buildComboArgsFromSnapshots(args, [singleSnap]);
+  const briefText = formatClientBrief(lang, [singleSnap]);
+
+  entry.pendingFinalize = {
+    args: comboArgs,
+    finalizeOpts: { multiServiceSnapshots: [singleSnap] },
+  };
+  entry.messages = [...entry.messages, { role: "assistant", content: briefText }];
+  await persistAfter(briefText);
+  return true;
+}
+
+async function finalizeOrder(ctx, entry, rawArgs, finalizeOpts = {}) {
+  const args = { ...(rawArgs || {}) };
+  const snaps = finalizeOpts.multiServiceSnapshots;
+  const aggregatedOrder = snaps?.length
+    ? mergeSnapshotsOrderData(snaps)
+    : mergeData(makeEmptyOrder(), entry.orderData || {});
+  const chatId = ctx.chat.id;
+  const userId = ctx.from.id;
+  const lang = entry.lang || "ru";
+
+  // ─── Final required-fields validation (formal schema source-of-truth) ─────
+  try {
+    const od = aggregatedOrder || {};
+    const cross = snaps?.length
+      ? crossFieldsForMultiFinalize(snaps, od, args)
+      : {
+          type: od.type || args.service_type || null,
+          size: od.size || args.size || null,
+          deadline: od.deadline || args.deadline || null,
+          contact: od.contact || args.contact || null,
+        };
+    const missing = missingRequiredFields(cross, REQUIRED_FIELDS);
+    // contact обработаем ниже (есть отдельная reask-логика)
+    const missingNoContact = missing.filter((f) => f !== "contact");
+    if (missingNoContact.length > 0) {
+      const first = missingNoContact[0];
+      const stepKey = first === "type" ? "service_type" : first;
+      const q = getQuestion(lang, stepKey) || getQuestion(lang, "service_type");
+      if (q) {
+        console.log(`[finalize/validate] chat=${chatId} missing=${missingNoContact.join(",")} ask=${stepKey}`);
+        await ctx.reply(q);
+        return;
+      }
+    }
+  } catch (err) {
+    console.error("Required-fields validation threw:", err.message);
+  }
+
+  const fallback = buildTelegramFallbackContact(ctx);
+  if (isPlaceholderContact(args.contact) || (!args.contact && fallback)) {
+    if (fallback) args.contact = fallback;
+  }
+  if (!isValidContact(args.contact)) {
+    if (fallback) {
+      args.contact = fallback;
+    } else {
+      const reask = CONTACT_REASK[lang] || CONTACT_REASK.ru;
+      await ctx.reply(reask);
+      return;
+    }
+  }
+
+  try {
+    const conversation = await upsertConversation({
+      telegramUserId: userId,
+      telegramChatId: chatId,
+      history: entry.messages,
+      files: entry.files,
+      lang,
+      status: "completed",
+      metadata: {
+        order: aggregatedOrder || null,
+        intake_state: { servicesQueue: [], idx: 0, perService: {} },
+        pending_finalize: null,
+      },
+    });
+
+    const enrichedArgs = {
+      ...args,
+      order_data: aggregatedOrder || null,
+      multi_services: snaps || args.multi_services,
+    };
+    console.log(`[finalize] chat=${chatId} args=`, JSON.stringify(enrichedArgs), "agg=", JSON.stringify(aggregatedOrder));
+    const order = await saveOrder({
+      conversationId: conversation.id,
+      telegramUserId: userId,
+      telegramChatId: chatId,
+      data: enrichedArgs,
+      files: entry.files,
+      lang,
+    });
+
+    // ─── CRM: создаём лида со score ────────────────────────────────────────
+    let lead = null;
+    try {
+      const score = calcLeadScore({ orderData: aggregatedOrder, files: entry.files });
+      lead = await createLead({
+        conversationId: conversation.id,
+        orderId: order.id,
+        telegramUserId: userId,
+        telegramChatId: chatId,
+        data: {
+          ...(aggregatedOrder || {}),
+          order_id: order.id,
+          lang,
+          username: ctx.from?.username || null,
+          multi_services: snaps || null,
+        },
+        leadScore: score,
+      });
+      console.log(`[lead] created id=${lead.id} score=${score} order=${order.id.substring(0,8)}`);
+    } catch (err) {
+      console.error("Lead creation failed:", err.message);
+    }
+
+    const orderDataSnapshot = { ...(aggregatedOrder || makeEmptyOrder()) };
+
+    await completeConversation(conversation.id);
+    clearContext(chatId);
+
+    const short = order.id.substring(0, 8);
+    const confirm = {
+      ru: `✅ Заявка №${short} принята!\n\nМенеджер свяжется с вами в ближайшее время.\nЕсли что-то добавить — просто напишите.`,
+      kk: `✅ №${short} өтінім қабылданды!\n\nМенеджер жақын арада сізбен байланысады.\nҚосымша мәлімет болса — жазыңыз.`,
+      en: `✅ Request #${short} accepted!\n\nA manager will get back to you shortly.\nIf you'd like to add anything — just send a message.`,
+    }[lang] || `✅ Заявка №${short} принята!`;
+    await ctx.reply(confirm);
+
+    try {
+      const kc = await buildKnowledgeContext({
+        lastUserMessage: "",
+        orderData: orderDataSnapshot,
+        lang,
+      });
+      const hint = await estimatePriceHint(orderDataSnapshot, lang, kc);
+      if (hint && hint.length > 15) {
+        await ctx.reply(`💡 Ориентир по бюджету (не оферта): ${hint}`);
+      }
+    } catch (e) {
+      console.error("[estimatePriceHint]", e.message);
+    }
+
+    await notifyManager(ctx, order, lang, enrichedArgs, lead, orderDataSnapshot);
+  } catch (err) {
+    console.error("Finalize error:", err.message);
+    await ctx.reply("Заявку записал, но возникла техническая ошибка при сохранении. Менеджер всё равно увидит ваше обращение.");
+    try {
+      await _bot.telegram.sendMessage(
+        getManagerChatId(),
+        `⚠️ Ошибка сохранения заявки от @${ctx.from?.username || ctx.from?.id}: ${err.message}\n\nДанные:\n${JSON.stringify(args, null, 2)}`
+      );
+    } catch { /* ignore */ }
+  }
+}
+
+/**
+ * Клиентские файлы хранятся как URL вида https://api.telegram.org/file/bot…/file_N.ext
+ * — шлём менеджеру как фото/документ, чтобы открывалось в Telegram, а не «голая» ссылка.
+ */
+async function sendManagerTelegramFileUrl(bot, managerChatId, url) {
+  const u = String(url || "").trim();
+  if (!u) return;
+  const pathPart = u.split("?")[0].toLowerCase();
+  const looksImage = /\.(jpg|jpeg|png|gif|webp)(\?|$)/i.test(pathPart);
+  try {
+    if (looksImage) {
+      await bot.telegram.sendPhoto(managerChatId, u);
+      return;
+    }
+    await bot.telegram.sendDocument(managerChatId, u);
+  } catch {
+    try {
+      if (looksImage) await bot.telegram.sendDocument(managerChatId, u);
+      else await bot.telegram.sendPhoto(managerChatId, u);
+    } catch {
+      await bot.telegram.sendMessage(managerChatId, `📎 ${u}`).catch(() => {});
+    }
+  }
+}
+
+async function notifyManager(ctx, order, lang = "ru", rawArgs = {}, lead = null, orderData = null) {
+  const username = ctx.from?.username ? `@${ctx.from.username}` : `id:${ctx.from?.id}`;
+  const meta = getLangMeta(lang);
+  const score = lead?.lead_score ?? 50;
+  const badge = scoreBadge(score);
+  const headerId = lead ? `#${lead.id}` : `№${order.id.substring(0, 8)}`;
+
+  const rawJson = order?.json_data;
+  const multiSnap =
+    rawArgs.multi_services ||
+    orderData?.multi_services ||
+    (Array.isArray(rawJson?.multi_services) ? rawJson.multi_services : null);
+
+  const lines = [
+    `🏢 ${AGENCY_NAME}`,
+    `🆕 Новый лид ${headerId} [${meta.badge}] ${badge} (${score})`,
+    ``,
+    `🎯 Услуга: ${order.service_type || "—"}`,
+    `📝 ${order.description || "—"}`,
+  ];
+  if (Array.isArray(multiSnap) && multiSnap.length > 1) {
+    lines.push("", `🧩 Позиций в заявке: ${multiSnap.length}`);
+    multiSnap.forEach((s, i) => {
+      lines.push(`  ${i + 1}) ${s.service_type || s.type || "—"} — ${s.description || s.content || "…"}`);
+    });
+    lines.push("");
+  }
+  if (order.size) lines.push(`📐 Размер: ${order.size}`);
+  if (order.quantity) lines.push(`🔢 Кол-во: ${order.quantity}`);
+  const extras = [
+    ["📍 Где",     rawArgs.location],
+    ["💡 Подсветка", rawArgs.lighting],
+    ["🏷 Использование", rawArgs.where_use],
+    ["⚪ Форма",    rawArgs.shape],
+    ["✨ Материал", rawArgs.material],
+    ["👕 Размеры",  rawArgs.sizes],
+    ["🖨 Технология", rawArgs.print_type],
+    ["📄 Бумага",   rawArgs.paper_type],
+    ["🎁 Изделие",  rawArgs.item],
+    ["🎨 Содержание", rawArgs.content],
+    ["🖼 Макет",    rawArgs.design],
+  ];
+  for (const [label, val] of extras) {
+    if (val && String(val).trim()) lines.push(`${label}: ${val}`);
+  }
+  // Допуслуги (upsell/cross-sell): orderData.extras → "➕ Допы: ...".
+  // Если orderData не передали (на всякий случай) — fallback на rawArgs.extras / order.extras.
+  const extrasArr =
+    (orderData && Array.isArray(orderData.extras) && orderData.extras) ||
+    (Array.isArray(rawArgs.extras) && rawArgs.extras) ||
+    (Array.isArray(order.extras) && order.extras) ||
+    [];
+  if (extrasArr.length > 0) {
+    const labels = extrasArr.map((id) => {
+      // Если id из UPSELL_MAP — заменим на ru-метку, иначе оставим как есть.
+      for (const opts of Object.values(UPSELL_MAP)) {
+        const found = opts.find((o) => o.id === id);
+        if (found) return found.label;
+      }
+      return String(id);
+    });
+    lines.push(`➕ Допы: ${labels.join(", ")}`);
+  }
+  lines.push(`📅 Срок: ${order.deadline || "—"}`);
+  if (order.budget) lines.push(`💰 Бюджет: ${order.budget}`);
+  lines.push(`📞 Контакт: ${order.contact || "—"}`);
+  if (order.notes) lines.push(`✏️ ${order.notes}`);
+  lines.push(``, `👤 От: ${username}`);
+  if (order.files?.length) lines.push(`📎 Файлов: ${order.files.length}`);
+
+  // Если лид не создался — fallback на старые order-кнопки.
+  const keyboard = lead ? {
+    inline_keyboard: [
+      [
+        { text: "🎯 Взять",    callback_data: `lead:take:${lead.id}` },
+        { text: "💬 Уточнить", callback_data: `lead:clarify:${lead.id}` },
+        { text: "📄 КП",       callback_data: `lead:proposal:${lead.id}` },
+      ],
+      [
+        { text: "✓ Закрыть",   callback_data: `lead:close:${lead.id}` },
+        { text: "✗ Отклонить", callback_data: `lead:reject:${lead.id}` },
+      ],
+    ],
+  } : {
+    inline_keyboard: [[
+      { text: "✅ Принять",   callback_data: `accept:${order.id}` },
+      { text: "❌ Отклонить", callback_data: `reject:${order.id}` },
+    ]],
+  };
+
+  await _bot.telegram.sendMessage(getManagerChatId(), lines.join("\n"), { reply_markup: keyboard });
+
+  const seenUrls = new Set();
+  for (const url of order.files || []) {
+    const u = String(url || "").trim();
+    if (!u || seenUrls.has(u)) continue;
+    seenUrls.add(u);
+    await sendManagerTelegramFileUrl(_bot, getManagerChatId(), u);
+  }
+
+  if (lead) {
+    try {
+      const crm = await exportLeadToAllIntegrations({
+        lead_id: lead.id,
+        order_id: order.id,
+        service_type: order.service_type,
+        description: order.description,
+        contact: order.contact,
+        username: ctx.from?.username || null,
+        lang,
+        telegram_chat_id: String(ctx.chat?.id),
+        files: order.files || [],
+      });
+      if (crm.errors?.length) {
+        console.error("[crm]", crm.errors.join("; "));
+        await _bot.telegram.sendMessage(getManagerChatId(), `⚠️ CRM: ${crm.errors.join("; ")}`).catch(() => {});
+      }
+    } catch (e) {
+      console.error("[crm export]", e.message);
+      await _bot.telegram.sendMessage(getManagerChatId(), `⚠️ CRM export: ${e.message}`).catch(() => {});
+    }
+    scheduleManagerLeadActionNudge(_bot, lead.id);
+  }
+}
+
+async function handleOwnerStats(ctx) {
+  try {
+    const snap = await getAnalyticsSnapshot();
+    const cLines = Object.entries(snap.conversationsByStatus).map(([k, v]) => `  ${k}: ${v}`);
+    const oLines = Object.entries(snap.ordersByStatus).map(([k, v]) => `  ${k}: ${v}`);
+    const top = snap.topServices.map(([s, n]) => `  ${s}: ${n}`).join("\n");
+    await ctx.reply(
+      [
+        "📊 Сводка (до 8000 строк / таблица)",
+        "",
+        `Сегодня (UTC с 00:00): заказов ${snap.ordersTodayUtc}, новых диалогов ${snap.conversationsCreatedTodayUtc}`,
+        "",
+        "Диалоги:",
+        ...cLines,
+        "",
+        "Заказы:",
+        ...oLines,
+        "",
+        `Всего заказов: ${snap.ordersTotal} · диалогов: ${snap.conversationsTotal}`,
+        "",
+        "Топ услуг:",
+        top || "  —",
+      ].join("\n")
+    );
+  } catch (e) {
+    await ctx.reply(`Ошибка /stats: ${e.message}`);
+  }
+}
+
+async function handleTemplatesCommand(ctx) {
+  if (String(ctx.chat?.id) === getManagerChatId()) return;
+  if (isClientPrivateChat(ctx) && managerCommandAllowed(ctx) && hasManagerUserAllowlist()) return;
+  const keyboard = {
+    inline_keyboard: ORDER_TEMPLATES.map((t) => [{ text: t.title, callback_data: `tpl:${t.id}` }]),
+  };
+  await ctx.reply("Шаблон — черновик полей заявки. Потом всё можно изменить текстом 👇", { reply_markup: keyboard });
+}
+
+async function handleTemplatePick(ctx, data) {
+  if (String(ctx.callbackQuery.message.chat.id) === getManagerChatId()) {
+    await ctx.answerCbQuery("Шаблоны — в чате с ботом как клиент").catch(() => {});
+    return;
+  }
+  const id = data.slice(4);
+  const tpl = getTemplateById(id);
+  await ctx.answerCbQuery(tpl ? "Ок" : "Нет такого").catch(() => {});
+  if (!tpl) return;
+  const chatId = ctx.callbackQuery.message.chat.id;
+  let entry = getContext(chatId) || {
+    messages: [],
+    files: [],
+    lang: "ru",
+    flagShown: false,
+    serviceCode: null,
+    orderData: makeEmptyOrder(),
+    upsellShown: false,
+  };
+  if (!entry.orderData) entry.orderData = makeEmptyOrder();
+  entry.orderData = mergeData(entry.orderData, normalizeToSchema(tpl.preset));
+  entry.messages = [...(entry.messages || []), { role: "user", content: `[шаблон: ${tpl.id}]` }];
+  setContext(chatId, entry);
+  await ctx.reply(`Шаблон «${tpl.title}» подставлен. Дополните срок, контакт и детали.`);
+}
+
+// ─── Manager callbacks ───────────────────────────────────────────────────────
+
+async function handleCallback(ctx) {
+  const data = ctx.callbackQuery?.data;
+  if (!data) return;
+
+  if (data.startsWith("tpl:")) {
+    return handleTemplatePick(ctx, data);
+  }
+
+  const chatId = String(ctx.callbackQuery.message?.chat?.id);
+  if (chatId !== getManagerChatId()) {
+    await ctx.answerCbQuery("Только менеджер").catch(() => {});
+    return;
+  }
+  if (!managerCommandAllowed(ctx)) {
+    await ctx.answerCbQuery("Нужны права менеджера").catch(() => {});
+    return;
+  }
+
+  // Manager-Assist callbacks: assist:send:<leadId>:<msgId>, assist:edit:<leadId>, assist:cancel:<msgId>
+  if (data.startsWith("assist:")) {
+    return handleAssistCallback(ctx, data, chatId);
+  }
+
+  // Proposal callbacks: proposal:send:<leadId>:<msgId>, proposal:edit:<leadId>, proposal:cancel:<msgId>
+  if (data.startsWith("proposal:")) {
+    return handleProposalCallback(ctx, data, chatId);
+  }
+
+  // Lead-callbacks: lead:take:N, lead:clarify:N, lead:close:N, lead:reject:N, lead:open:N, lead:proposal:N
+  if (data.startsWith("lead:")) {
+    return handleLeadCallback(ctx, data, chatId);
+  }
+
+  // Knowledge-base callbacks: kb:delete:N
+  if (data.startsWith("kb:")) {
+    return handleKbCallback(ctx, data, chatId);
+  }
+
+  // Legacy order-callbacks: accept:UUID, reject:UUID
+  const [action, id] = data.split(":");
+  if (!id) return;
+
+  try {
+    const msgId = ctx.callbackQuery.message.message_id;
+    await ctx.answerCbQuery();
+
+    if (action === "accept") {
+      const order = await getOrderById(id);
+      await updateOrderStatus(id, "in_progress");
+      await ctx.telegram.editMessageReplyMarkup(chatId, msgId, undefined, { inline_keyboard: [] });
+      await ctx.telegram.sendMessage(chatId, `✅ Заявка ${id.substring(0, 8)} принята.`);
+      if (order.telegram_chat_id) {
+        await ctx.telegram.sendMessage(
+          order.telegram_chat_id,
+          "Заявка принята в работу ✅\nС вами скоро свяжется менеджер для уточнения деталей 📞"
+        ).catch(() => {});
+      }
+    } else if (action === "reject") {
+      const order = await getOrderById(id);
+      await updateOrderStatus(id, "rejected");
+      await ctx.telegram.editMessageReplyMarkup(chatId, msgId, undefined, { inline_keyboard: [] });
+      await ctx.telegram.sendMessage(chatId, `❌ Заявка ${id.substring(0, 8)} отклонена.`);
+      if (order.telegram_chat_id) {
+        await ctx.telegram.sendMessage(
+          order.telegram_chat_id,
+          "К сожалению, по вашему запросу мы не сможем помочь. Спасибо за обращение!"
+        ).catch(() => {});
+      }
+    }
+  } catch (err) {
+    console.error("Callback error:", err.message);
+    await ctx.answerCbQuery("Ошибка").catch(() => {});
+  }
+}
+
+// ─── Lead callbacks (CRM в Telegram) ─────────────────────────────────────────
+
+async function handleLeadCallback(ctx, data, chatId) {
+  const [, action, leadIdStr] = data.split(":");
+  const leadId = parseInt(leadIdStr, 10);
+  if (!leadId || !action) {
+    await ctx.answerCbQuery("Неверные данные").catch(() => {});
+    return;
+  }
+
+  const msgId = ctx.callbackQuery.message?.message_id;
+
+  try {
+    let lead;
+    try {
+      lead = await getLeadById(leadId);
+    } catch (e) {
+      await ctx.answerCbQuery("Лид не найден").catch(() => {});
+      return;
+    }
+
+    if (action === "take") {
+      await updateLead(leadId, { status: "in_progress", assigned_to: Number(ctx.from.id) });
+      await ctx.answerCbQuery("Взято в работу").catch(() => {});
+      if (msgId) {
+        await ctx.telegram.editMessageReplyMarkup(chatId, msgId, undefined, {
+          inline_keyboard: [
+            [{ text: "💬 Уточнить",   callback_data: `lead:clarify:${leadId}` }],
+            [
+              { text: "✓ Закрыть",   callback_data: `lead:close:${leadId}` },
+              { text: "✗ Отклонить", callback_data: `lead:reject:${leadId}` },
+            ],
+          ],
+        }).catch(() => {});
+      }
+      await ctx.telegram.sendMessage(chatId,
+        `🎯 Вы взяли заявку #${leadId} в работу.\n` +
+        `Можете писать клиенту через бота: /reply ${leadId} <текст>`
+      );
+      return;
+    }
+
+    if (action === "clarify") {
+      await ctx.answerCbQuery().catch(() => {});
+      setManagerReplyMode(ctx.from.id, leadId);
+      await ctx.telegram.sendMessage(
+        chatId,
+        `💬 Ответ клиенту по лиду #${leadId}.\n` +
+          `Одно следующее сообщение: текст или голос — перефразирую во вежливое сообщение клиенту с пометкой «Менеджер:»; фото/файлы — как копию.\n` +
+          `Режим ~15 минут, выключится после отправки. Важно: без этого шага голос не считается ответом клиенту (в т.ч. в личке бота).\n` +
+          `Подсказка: AI-черновик — /assist ${leadId}`
+      );
+      return;
+    }
+
+    if (action === "proposal") {
+      await ctx.answerCbQuery("Генерирую КП…").catch(() => {});
+      await proposeProposalDraft(ctx, leadId, lead);
+      return;
+    }
+
+    if (action === "close") {
+      await updateLead(leadId, { status: "closed" });
+      await ctx.answerCbQuery("Закрыто").catch(() => {});
+      if (msgId) await ctx.telegram.editMessageReplyMarkup(chatId, msgId, undefined, { inline_keyboard: [] }).catch(() => {});
+      await ctx.telegram.sendMessage(chatId, `✓ Заявка #${leadId} закрыта.`);
+      const cLang = lead.data?.lang || "ru";
+      const closedMsg = {
+        ru: "Спасибо за обращение! Заявка обработана ✅",
+        kk: "Хабарласқаныңызға рахмет! Өтінім өңделді ✅",
+        en: "Thank you! Your request has been handled ✅",
+      }[cLang] || "Спасибо за обращение! Заявка обработана ✅";
+      if (lead.telegram_chat_id) {
+        await ctx.telegram.sendMessage(String(lead.telegram_chat_id), closedMsg).catch(() => {});
+      }
+      return;
+    }
+
+    if (action === "reject") {
+      await updateLead(leadId, { status: "rejected" });
+      await ctx.answerCbQuery("Отклонено").catch(() => {});
+      if (msgId) await ctx.telegram.editMessageReplyMarkup(chatId, msgId, undefined, { inline_keyboard: [] }).catch(() => {});
+      await ctx.telegram.sendMessage(chatId, `✗ Заявка #${leadId} отклонена.`);
+      const cLang = lead.data?.lang || "ru";
+      const rejectedMsg = {
+        ru: "К сожалению, по вашему запросу мы не сможем помочь. Спасибо за обращение!",
+        kk: "Өкінішке орай, сіздің сұранысыңыз бойынша көмектесе алмаймыз. Хабарласқаныңызға рахмет!",
+        en: "Unfortunately, we can't help with your request. Thanks for reaching out!",
+      }[cLang] || "К сожалению, по вашему запросу мы не сможем помочь.";
+      if (lead.telegram_chat_id) {
+        await ctx.telegram.sendMessage(String(lead.telegram_chat_id), rejectedMsg).catch(() => {});
+      }
+      return;
+    }
+
+    if (action === "open") {
+      await ctx.answerCbQuery().catch(() => {});
+      await sendLeadDetail(ctx, leadId);
+      return;
+    }
+
+    await ctx.answerCbQuery("Неизвестное действие").catch(() => {});
+  } catch (err) {
+    console.error("Lead callback error:", err.message);
+    await ctx.answerCbQuery(`Ошибка: ${err.message}`).catch(() => {});
+  }
+}
+
+// ─── Manager → Client reply (через /reply N <текст> или clarify ForceReply) ──
+
+async function sendManagerReplyToClient(ctx, leadId, text) {
+  try {
+    const lead = await getLeadById(leadId);
+    if (!lead) {
+      await ctx.reply(`Лид #${leadId} не найден.`);
+      return;
+    }
+    if (!lead.telegram_chat_id) {
+      await ctx.reply(`У лида #${leadId} нет chat_id клиента.`);
+      return;
+    }
+
+    const cLang = lead.data?.lang || "ru";
+    const prefix = { ru: "Менеджер:", kk: "Менеджер:", en: "Manager:" }[cLang] || "Менеджер:";
+    await ctx.sendChatAction("typing").catch(() => {});
+    const polished = ((await polishRelayForClient(text, cLang)) || text).trim() || text;
+    const msg = `${prefix} ${polished}`;
+
+    await _bot.telegram.sendMessage(String(lead.telegram_chat_id), msg);
+
+    if (lead.conversation_id) {
+      await appendConversationMessage(lead.conversation_id, "manager", polished);
+    }
+
+    await ctx.reply(`✓ Отправлено клиенту по лиду #${leadId}.`);
+  } catch (err) {
+    console.error("sendManagerReplyToClient error:", err.message);
+    await ctx.reply(`Ошибка отправки: ${err.message}`);
+  }
+}
+
+async function handleReplyCommand(ctx) {
+  const raw = (ctx.message?.text || "").replace(/^\/reply(@\w+)?\s*/, "").trim();
+  const m = raw.match(/^(\d+)\s+([\s\S]+)$/);
+  if (!m) {
+    await ctx.reply("Использование: /reply <ID лида> <текст>\nПример: /reply 12 Здравствуйте! Уточните, пожалуйста, размер.");
+    return;
+  }
+  const leadId = parseInt(m[1], 10);
+  const text = m[2].trim();
+  await sendManagerReplyToClient(ctx, leadId, text);
+}
+
+// ─── /leads command ──────────────────────────────────────────────────────────
+
+async function handleLeadsCommand(ctx) {
+  const raw = (ctx.message?.text || "").replace(/^\/leads(@\w+)?/, "").trim();
+  const parts = raw ? raw.split(/\s+/) : [];
+
+  if (parts.length === 0) return sendLeadsSummary(ctx);
+
+  const arg = parts[0].toLowerCase();
+  if (/^\d+$/.test(arg)) return sendLeadDetail(ctx, parseInt(arg, 10));
+  if (arg === "new" || arg === "in_progress" || arg === "closed" || arg === "rejected") {
+    return sendLeadsListByStatus(ctx, arg);
+  }
+  if (arg === "hot" || arg === "warm" || arg === "cold") {
+    return sendLeadsListByTier(ctx, arg);
+  }
+  await ctx.reply([
+    "Использование:",
+    "/leads — сводка",
+    "/leads new — новые",
+    "/leads in_progress — в работе",
+    "/leads hot|warm|cold — по score",
+    "/leads <ID> — детали",
+  ].join("\n"));
+}
+
+async function sendLeadsSummary(ctx) {
+  try {
+    const s = await getLeadsSummary();
+    const lines = [
+      `📊 Лиды — сводка`,
+      ``,
+      `Всего: ${s.total}  •  активных: ${s.active}`,
+      ``,
+      `🆕 new: ${s.by_status.new}`,
+      `🔄 in_progress: ${s.by_status.in_progress}`,
+      `✓ closed: ${s.by_status.closed}`,
+      `✗ rejected: ${s.by_status.rejected}`,
+      ``,
+      `🔥 HOT: ${s.by_tier.hot}`,
+      `🟡 WARM: ${s.by_tier.warm}`,
+      `🔵 COLD: ${s.by_tier.cold}`,
+      ``,
+      `Команды: /leads new, /leads in_progress, /leads hot, /leads <ID>`,
+      ``,
+      `Кнопки снизу дублируют команды — можно нажать вместо ввода.`,
+    ];
+    await ctx.reply(lines.join("\n"), { reply_markup: getManagerLeadsKeyboardMarkup() });
+  } catch (err) {
+    await ctx.reply(`Ошибка сводки: ${err.message}`);
+  }
+}
+
+function leadShortLine(lead) {
+  const badge = scoreBadge(lead.lead_score ?? 50);
+  const cLang = (lead.data?.lang || "ru").toUpperCase();
+  const desc = String(lead.data?.description || lead.data?.type || "—").slice(0, 60);
+  const deadline = lead.data?.deadline || "—";
+  return `#${lead.id} ${badge} [${cLang}] ${desc} • срок: ${deadline}`;
+}
+
+async function sendLeadsListByStatus(ctx, status) {
+  try {
+    const leads = await getLeadsByStatus(status, 10);
+    if (!leads.length) {
+      await ctx.reply(`Лидов со статусом «${status}» нет.`);
+      return;
+    }
+    for (const lead of leads) {
+      const line = leadShortLine(lead);
+      await ctx.reply(line, {
+        reply_markup: {
+          inline_keyboard: [[{ text: "Открыть", callback_data: `lead:open:${lead.id}` }]],
+        },
+      });
+    }
+  } catch (err) {
+    await ctx.reply(`Ошибка: ${err.message}`);
+  }
+}
+
+async function sendLeadsListByTier(ctx, tier) {
+  try {
+    const leads = await getLeadsByTier(tier, 10);
+    if (!leads.length) {
+      await ctx.reply(`Активных лидов уровня «${tier}» нет.`);
+      return;
+    }
+    for (const lead of leads) {
+      const line = leadShortLine(lead);
+      await ctx.reply(line, {
+        reply_markup: {
+          inline_keyboard: [[{ text: "Открыть", callback_data: `lead:open:${lead.id}` }]],
+        },
+      });
+    }
+  } catch (err) {
+    await ctx.reply(`Ошибка: ${err.message}`);
+  }
+}
+
+async function sendLeadDetail(ctx, leadId) {
+  try {
+    const lead = await getLeadById(leadId);
+    if (!lead) {
+      await ctx.reply(`Лид #${leadId} не найден.`);
+      return;
+    }
+    const score = lead.lead_score ?? 50;
+    const badge = scoreBadge(score);
+    const cLang = (lead.data?.lang || "ru").toUpperCase();
+    const d = lead.data || {};
+
+    const head = [
+      `📋 Лид #${lead.id} ${badge} (${score}) [${cLang}]`,
+      `Статус: ${lead.status}${lead.assigned_to ? ` • назначен: ${lead.assigned_to}` : ""}`,
+      `Создан: ${new Date(lead.created_at).toISOString().slice(0, 16).replace("T", " ")}`,
+    ];
+
+    const fields = [
+      ["🎯 Тип",        d.type],
+      ["📝 Описание",   d.description],
+      ["📐 Размер",     d.size],
+      ["🔢 Кол-во",     d.quantity],
+      ["📍 Где",        d.location],
+      ["💡 Подсветка",  d.lighting],
+      ["🏷 Использование", d.where_use],
+      ["⚪ Форма",      d.shape],
+      ["✨ Материал",   d.material],
+      ["👕 Размеры",    d.sizes],
+      ["🖨 Технология", d.print_type],
+      ["📄 Бумага",     d.paper_type],
+      ["🎁 Изделие",    d.item],
+      ["🎨 Содержание", d.content],
+      ["🖼 Макет",      d.design],
+      ["📅 Срок",       d.deadline],
+      ["💰 Бюджет",     d.budget],
+      ["📞 Контакт",    d.contact],
+    ].filter(([, v]) => v && String(v).trim());
+
+    const lines = [
+      ...head,
+      "",
+      ...fields.map(([k, v]) => `${k}: ${v}`),
+    ];
+    if (Array.isArray(d.files) && d.files.length) lines.push(`📎 Файлов: ${d.files.length}`);
+
+    const kbRows = [];
+    if (lead.status === "new") {
+      kbRows.push([{ text: "🎯 Взять в работу", callback_data: `lead:take:${lead.id}` }]);
+    }
+    if (lead.status === "new" || lead.status === "in_progress") {
+      kbRows.push([{ text: "💬 Уточнить", callback_data: `lead:clarify:${lead.id}` }]);
+      kbRows.push([
+        { text: "✓ Закрыть",   callback_data: `lead:close:${lead.id}` },
+        { text: "✗ Отклонить", callback_data: `lead:reject:${lead.id}` },
+      ]);
+    }
+
+    await ctx.reply(lines.join("\n"), kbRows.length ? { reply_markup: { inline_keyboard: kbRows } } : {});
+
+    if (lead.conversation_id) {
+      const { history } = await getConversationHistoryForLead(lead.conversation_id, 10);
+      if (history && history.length) {
+        const histLines = ["💬 Последние сообщения:"];
+        for (const m of history) {
+          const role = m.role === "assistant" ? "🤖" : (m.role === "manager" ? "👤" : "👥");
+          const txt = String(m.content || "").slice(0, 200).replace(/\n+/g, " ");
+          histLines.push(`${role} ${txt}`);
+        }
+        await ctx.reply(histLines.join("\n"));
+      }
+    }
+  } catch (err) {
+    await ctx.reply(`Ошибка: ${err.message}`);
+  }
+}
+
+// ─── Manager-only listings (legacy /new, /active, /today) ────────────────────
+
+async function handleOwnerList(ctx, status, title) {
+  try {
+    const orders = await getOrdersByStatus(status);
+    if (!orders.length) { await ctx.reply(`${title}: нет заявок.`); return; }
+    const lines = orders.map(o =>
+      `🆔 ${o.id.substring(0, 8)} | ${o.service_type || "?"} | ${(o.description || "").substring(0, 40)} | ${o.contact || "?"}`
+    );
+    await ctx.reply(`${title}:\n\n${lines.join("\n")}`);
+  } catch (err) {
+    console.error("Owner list error:", err.message);
+    await ctx.reply(`Ошибка: ${err.message}`);
+  }
+}
+
+async function handleOwnerToday(ctx) {
+  try {
+    const orders = await getOrdersToday();
+    if (!orders.length) { await ctx.reply("За сегодня заявок нет."); return; }
+    const lines = orders.map(o =>
+      `🆔 ${o.id.substring(0, 8)} | ${o.service_type || "?"} | ${o.status}`
+    );
+    await ctx.reply(`За сегодня (${orders.length}):\n\n${lines.join("\n")}`);
+  } catch (err) {
+    console.error("Today error:", err.message);
+    await ctx.reply(`Ошибка: ${err.message}`);
+  }
+}
+
+// ─── Manager Assist (AI-помощник: предлагает текст ответа клиенту) ───────────
+
+/**
+ * Достать последнее сообщение клиента из истории разговора (role === "user").
+ */
+function lastClientMessage(history) {
+  if (!Array.isArray(history)) return "";
+  for (let i = history.length - 1; i >= 0; i--) {
+    const m = history[i];
+    if (m && m.role === "user" && m.content) return String(m.content);
+  }
+  // Fallback — последнее любое
+  const last = history[history.length - 1];
+  return last && last.content ? String(last.content) : "";
+}
+
+/**
+ * Сгенерировать AI-предложение и отправить менеджеру с кнопками
+ * [✉ Отправить] [✏️ Изменить] [✗ Отмена].
+ *
+ * @param {*} ctx — Telegraf ctx
+ * @param {number} leadId
+ * @param {object} [leadPreloaded] — если уже подгружен, не дёргаем БД повторно
+ */
+async function proposeAssistReply(ctx, leadId, leadPreloaded = null) {
+  try {
+    const lead = leadPreloaded || (await getLeadById(leadId));
+    if (!lead) {
+      await ctx.telegram.sendMessage(getManagerChatId(), `Лид #${leadId} не найден.`).catch(() => {});
+      return;
+    }
+
+    // lead.data — это плоский объект с полями orderData (type/size/contact/...) + lang/order_id/username
+    const orderData = lead.data || {};
+    let history = [];
+    let lang = lead.data?.lang || "ru";
+    if (lead.conversation_id) {
+      const h = await getConversationHistoryForLead(lead.conversation_id, 10);
+      history = Array.isArray(h?.history) ? h.history : [];
+      if (h?.lang) lang = h.lang;
+    }
+    const lastUserMessage = lastClientMessage(history);
+
+    const text = await assistManagerReply({
+      orderData,
+      history,
+      lang,
+      lastUserMessage,
+    });
+
+    if (!text) {
+      await ctx.telegram.sendMessage(
+        getManagerChatId(),
+        `⚠️ Не удалось сгенерировать вариант ответа для лида #${leadId}. ` +
+        `Можно написать вручную: /reply ${leadId} <текст>`
+      ).catch(() => {});
+      return;
+    }
+
+    // Пока msgId не известен — отправим без кнопок, потом отредактируем
+    // (чтобы вшить в callback_data сам msgId, а не накапливать вторичный поиск).
+    // Шаг 1: шлём с временным разметом без msgId — кнопки edit/cancel уже работают.
+    const sent = await ctx.telegram.sendMessage(
+      getManagerChatId(),
+      `💡 Вариант ответа клиенту #${leadId}:\n\n«${text}»`,
+      {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: "✉ Отправить",  callback_data: `assist:send:${leadId}:0` },
+              { text: "✏️ Изменить",  callback_data: `assist:edit:${leadId}` },
+              { text: "✗ Отмена",     callback_data: `assist:cancel:0` },
+            ],
+          ],
+        },
+      }
+    );
+
+    // Сохраняем драфт по msgId (то, что прилетит в send-callback).
+    const msgId = sent.message_id;
+    setAssistDraft(msgId, { leadId, text, lang });
+
+    // Шаг 2: пере-приклеиваем кнопки с актуальным msgId, чтобы send брал draft по нему.
+    await ctx.telegram.editMessageReplyMarkup(getManagerChatId(), msgId, undefined, {
+      inline_keyboard: [
+        [
+          { text: "✉ Отправить",  callback_data: `assist:send:${leadId}:${msgId}` },
+          { text: "✏️ Изменить",  callback_data: `assist:edit:${leadId}` },
+          { text: "✗ Отмена",     callback_data: `assist:cancel:${msgId}` },
+        ],
+      ],
+    }).catch(() => {});
+  } catch (err) {
+    console.error("proposeAssistReply error:", err.message);
+    await ctx.telegram.sendMessage(getManagerChatId(), `⚠️ Ошибка ассистента: ${err.message}`).catch(() => {});
+  }
+}
+
+/**
+ * Обработка assist:* callback'ов.
+ * Форматы:
+ *   assist:send:<leadId>:<msgId>  — отправить сохранённый текст клиенту
+ *   assist:edit:<leadId>          — открыть ForceReply, менеджер пишет свой текст
+ *   assist:cancel:<msgId>         — отбой, удалить кнопки и draft
+ */
+async function handleAssistCallback(ctx, data, chatId) {
+  const parts = data.split(":");
+  const action = parts[1];
+  const msgId = ctx.callbackQuery.message?.message_id;
+
+  try {
+    if (action === "send") {
+      const leadId = parseInt(parts[2], 10);
+      const draftMsgId = parseInt(parts[3], 10) || msgId;
+      const draft = getAssistDraft(draftMsgId);
+      if (!draft || draft.leadId !== leadId) {
+        await ctx.answerCbQuery("Черновик устарел. Сгенерируйте заново.").catch(() => {});
+        if (msgId) {
+          await ctx.telegram.editMessageReplyMarkup(chatId, msgId, undefined, { inline_keyboard: [] }).catch(() => {});
+        }
+        return;
+      }
+      await sendManagerReplyToClient(ctx, leadId, draft.text);
+      deleteAssistDraft(draftMsgId);
+      await ctx.answerCbQuery("Отправлено клиенту").catch(() => {});
+      if (msgId) {
+        await ctx.telegram.editMessageReplyMarkup(chatId, msgId, undefined, { inline_keyboard: [] }).catch(() => {});
+      }
+      return;
+    }
+
+    if (action === "edit") {
+      const leadId = parseInt(parts[2], 10);
+      // Снимаем кнопки у предложения, чтобы не зависало.
+      if (msgId) {
+        await ctx.telegram.editMessageReplyMarkup(chatId, msgId, undefined, { inline_keyboard: [] }).catch(() => {});
+        deleteAssistDraft(msgId);
+      }
+      const sent = await ctx.telegram.sendMessage(
+        chatId,
+        `✏️ Введите свой вариант ответа клиенту по заявке #${leadId}:`,
+        { reply_markup: { force_reply: true, selective: true } }
+      );
+      pendingClarify.set(getManagerChatId(), { leadId, promptMessageId: sent.message_id });
+      await ctx.answerCbQuery("Ответьте на это сообщение").catch(() => {});
+      return;
+    }
+
+    if (action === "cancel") {
+      const draftMsgId = parseInt(parts[2], 10) || msgId;
+      if (draftMsgId) deleteAssistDraft(draftMsgId);
+      if (msgId) {
+        await ctx.telegram.editMessageReplyMarkup(chatId, msgId, undefined, { inline_keyboard: [] }).catch(() => {});
+      }
+      await ctx.answerCbQuery("Отменено").catch(() => {});
+      return;
+    }
+
+    await ctx.answerCbQuery("Неизвестное действие").catch(() => {});
+  } catch (err) {
+    console.error("handleAssistCallback error:", err.message);
+    await ctx.answerCbQuery(`Ошибка: ${err.message}`).catch(() => {});
+  }
+}
+
+/**
+ * /assist <leadId> — менеджер вручную просит AI предложить ответ.
+ */
+async function handleAssistCommand(ctx) {
+  const raw = (ctx.message?.text || "").replace(/^\/assist(@\w+)?\s*/, "").trim();
+  const m = raw.match(/^(\d+)\s*$/);
+  if (!m) {
+    await ctx.reply("Использование: /assist <ID лида>\nПример: /assist 12");
+    return;
+  }
+  const leadId = parseInt(m[1], 10);
+  await proposeAssistReply(ctx, leadId);
+}
+
+// ─── Knowledge base: /teach, /knowledge, kb:delete ───────────────────────────
+//
+// Менеджер обучает бота — LLM извлекает type/title/structured_data, бот
+// сохраняет в knowledge_items (+ embedding). Команды доступны
+// ТОЛЬКО менеджеру (защита через ownerOnly при регистрации).
+
+function kbCategoryLabel(cat) {
+  switch (cat) {
+    case "material": return "📦 материал";
+    case "service":  return "🛠 услуга";
+    case "rule":     return "📋 правило";
+    case "price":    return "💰 цена";
+    case "tip":      return "💡 совет";
+    default:         return cat || "—";
+  }
+}
+
+function kbFormatLine(rec) {
+  const typ = rec.type || rec.category;
+  const title = String(rec.title ?? rec.name ?? "").trim();
+  const sd = rec.structured_data && typeof rec.structured_data === "object" ? rec.structured_data : {};
+  const priceVal = sd.price != null ? sd.price : rec.price;
+  const head = `#${rec.id} ${kbCategoryLabel(typ)} ${title || "—"}`;
+  const price =
+    priceVal !== null && priceVal !== undefined && priceVal !== ""
+      ? ` — ${Number(priceVal).toLocaleString("ru-RU")} ₸`
+      : "";
+  const body = String(rec.content ?? rec.description ?? "").trim();
+  const desc = body ? ` — ${body.slice(0, 60)}${body.length > 60 ? "…" : ""}` : "";
+  return `${head}${price}${desc}`;
+}
+
+const TRANSCRIPT_CHUNK = 3900;
+
+function formatConversationTranscript(history) {
+  const h = Array.isArray(history) ? history : [];
+  if (!h.length) return "(история пустая)";
+  const lines = [];
+  for (let i = 0; i < h.length; i++) {
+    const m = h[i];
+    const role = String(m?.role || "?");
+    const ts = m?.ts ? String(m.ts).replace("T", " ").slice(0, 19) : "";
+    const c = String(m?.content ?? "").trim() || "—";
+    lines.push(`[${i + 1}] ${role}${ts ? " " + ts : ""}:\n${c}`);
+  }
+  return lines.join("\n\n—\n\n");
+}
+
+async function sendTranscriptChunks(ctx, fullText) {
+  const t = String(fullText || "");
+  if (!t.length) {
+    await ctx.reply("(пусто)");
+    return;
+  }
+  for (let i = 0; i < t.length; i += TRANSCRIPT_CHUNK) {
+    const part = t.slice(i, i + TRANSCRIPT_CHUNK);
+    await ctx.reply(part).catch((e) => console.error("[transcript] send:", e.message));
+  }
+}
+
+/**
+ * Менеджер: полный лог переписки из Supabase проекта бота (conversations.history).
+ * Голос клиента хранится как следующее user-сообщение с текстом после Whisper.
+ */
+async function handleTranscriptCommand(ctx) {
+  const raw = (ctx.message?.text || "").replace(/^\/transcript(@\S+)?\s*/i, "").trim();
+  if (!raw) {
+    await ctx.reply(
+      "📜 Лог из базы этого бота (тот же SUPABASE_URL, что в Railway; EngHub и прочие проекты не используются):\n\n" +
+        "/transcript <id лида> — цепочка по `leads.conversation_id`\n" +
+        "/transcript chat <telegram_chat_id> — последняя беседа клиента по chat_id\n\n" +
+        "В логе голос = обычное сообщение user с распознанным текстом."
+    );
+    return;
+  }
+
+  await ctx.sendChatAction("typing").catch(() => {});
+
+  let header = "";
+  let history = [];
+
+  const chatMatch = raw.match(/^chat\s+(-?\d+)\s*$/i);
+  if (chatMatch) {
+    const conv = await getLatestConversationByTelegramChatId(chatMatch[1]);
+    if (!conv) {
+      await ctx.reply(`Беседа для chat_id=${chatMatch[1]} не найдена.`);
+      return;
+    }
+    history = conv.history || [];
+    header =
+      `📜 Беседа ${conv.id}\n` +
+      `chat_id: ${conv.telegram_chat_id} | status: ${conv.status} | lang: ${conv.lang || "?"}\n` +
+      `updated: ${conv.updated_at}\n` +
+      `сообщений: ${history.length}\n\n`;
+  } else {
+    const leadId = parseInt(raw, 10);
+    if (!Number.isFinite(leadId)) {
+      await ctx.reply("Укажите числовой id лида или: chat <telegram_chat_id>");
+      return;
+    }
+    let lead;
+    try {
+      lead = await getLeadById(leadId);
+    } catch {
+      await ctx.reply(`Лид #${leadId} не найден.`);
+      return;
+    }
+    if (!lead.conversation_id) {
+      await ctx.reply(`У лида #${leadId} нет conversation_id.`);
+      return;
+    }
+    const conv = await getConversationFullHistory(lead.conversation_id);
+    if (!conv) {
+      await ctx.reply(`Беседа ${lead.conversation_id} не найдена в БД.`);
+      return;
+    }
+    history = conv.history || [];
+    header =
+      `📜 Лид #${leadId} | беседа ${lead.conversation_id}\n` +
+      `chat_id: ${lead.telegram_chat_id} | статус лида: ${lead.status}\n` +
+      `status беседы: ${conv.status} | lang: ${conv.lang || "?"}\n` +
+      `updated: ${conv.updated_at}\n` +
+      `сообщений: ${history.length}\n\n`;
+  }
+
+  const body = formatConversationTranscript(history);
+  await sendTranscriptChunks(ctx, header + body);
+}
+
+async function handleTeachCommand(ctx) {
+  setManagerState(ctx.chat.id, "awaiting_teach_input");
+  await ctx.reply(
+    "🧠 Жду материал для базы знаний (тип и структура — автоматом): текст, голос или файл (PDF / .txt / .md / .csv).\n\n" +
+    "Например: «Холст 380 г/м² для широкоформатной печати, цена 2500 тг/м², хорошо для билбордов и баннеров на улице».\n\n" +
+    "Чтобы отменить — /reset."
+  );
+}
+
+async function handleKnowledgeCommand(ctx) {
+  // /knowledge или /knowledge <category>
+  const text = ctx.message?.text?.trim() || "";
+  const parts = text.split(/\s+/);
+  const filter = parts[1] && KB_CATEGORIES.includes(parts[1].toLowerCase()) ? parts[1].toLowerCase() : null;
+
+  let records;
+  try {
+    records = await listKnowledge({ category: filter, limit: 20 });
+  } catch (err) {
+    console.error("listKnowledge failed:", err.message);
+    await ctx.reply(`❌ Ошибка чтения базы знаний: ${err.message}`);
+    return;
+  }
+
+  if (!records.length) {
+    await ctx.reply(
+      filter
+        ? `📚 База знаний (${kbCategoryLabel(filter)}) пуста. Добавьте через /teach.`
+        : "📚 База знаний пуста. Добавьте через /teach."
+    );
+    return;
+  }
+
+  const header = filter
+    ? `📚 База знаний — ${kbCategoryLabel(filter)} (последние ${records.length})`
+    : `📚 База знаний (последние ${records.length})\nФильтры: /knowledge material | service | rule | price | tip`;
+  await ctx.reply(header);
+
+  // Каждую запись — отдельным сообщением с кнопкой Удалить.
+  for (const rec of records) {
+    await ctx.telegram.sendMessage(ctx.chat.id, kbFormatLine(rec), {
+      reply_markup: {
+        inline_keyboard: [[{ text: "🗑 Удалить", callback_data: `kb:delete:${rec.id}` }]],
+      },
+    }).catch((e) => console.error("kb list send failed:", e.message));
+  }
+}
+
+/**
+ * Режим «рассчитай»: поиск по базе знаний + ответ только по structured_data (без выдуманных цен).
+ */
+async function maybeHandleManagerCalculate(ctx, userMessage) {
+  if (String(ctx.chat?.id) !== getManagerChatId()) return false;
+  if (!managerCommandAllowed(ctx)) return false;
+  const raw = String(userMessage || "").trim();
+  if (!/^рассчитай/i.test(raw)) return false;
+
+  const query = raw.replace(/^рассчитай[!?.]*\s*/i, "").trim() || raw;
+  await ctx.sendChatAction("typing").catch(() => {});
+
+  let items = [];
+  try {
+    items = await searchKnowledge(query, 5);
+  } catch (err) {
+    console.error("searchKnowledge (calculate):", err.message);
+    await ctx.reply(`❌ Ошибка поиска: ${err.message}`).catch(() => {});
+    return true;
+  }
+
+  let summary = "";
+  try {
+    summary = await summarizeManagerCalculation(query, items, "ru");
+  } catch (err) {
+    console.error("summarizeManagerCalculation:", err.message);
+    summary = "Не удалось сформулировать расчёт.";
+  }
+  await ctx.reply(summary || "В базе знаний не нашлось подходящих записей с числами.").catch(() => {});
+  return true;
+}
+
+/**
+ * Если менеджер в состоянии awaiting_teach_input — обрабатываем входящий
+ * текст/транскрипт/извлечённый из файла текст как заметку для базы знаний и возвращаем true.
+ * Иначе возвращаем false (пусть идёт обычная диалоговая логика).
+ */
+async function maybeHandleManagerTeachInput(ctx, text, source = "text") {
+  if (String(ctx.chat?.id) !== getManagerChatId()) return false;
+  const ms = getManagerState(ctx.chat.id);
+  if (!ms || ms.state !== "awaiting_teach_input") return false;
+
+  // Сразу гасим состояние — даже если упадёт, не зацикливаемся.
+  clearManagerState(ctx.chat.id);
+
+  await ctx.sendChatAction("typing").catch(() => {});
+
+  let extracted;
+  try {
+    extracted = await extractKnowledge(text);
+  } catch (err) {
+    console.error("extractKnowledge threw:", err.message);
+    await ctx.reply(`❌ Не получилось разобрать заметку: ${err.message}`);
+    return true;
+  }
+
+  if (!extracted) {
+    await ctx.reply("❌ Не получилось извлечь структуру из заметки. Попробуйте сформулировать конкретнее.");
+    return true;
+  }
+
+  const tags = Array.isArray(extracted.structured_data?.tags)
+    ? extracted.structured_data.tags.map((t) => String(t)).filter(Boolean)
+    : [];
+  const priceRaw = extracted.structured_data?.price;
+  let price = priceRaw === "" || priceRaw === undefined ? null : Number(priceRaw);
+  if (!Number.isFinite(price)) price = null;
+
+  let embedding = null;
+  try {
+    const embText = [extracted.title, extracted.clean_text].filter(Boolean).join("\n").slice(0, 8000);
+    if (embText.trim()) embedding = await createEmbedding(embText);
+  } catch (err) {
+    console.warn("createEmbedding (teach):", err.message);
+  }
+
+  let saved;
+  try {
+    saved = await addKnowledge({
+      category: extracted.type,
+      name: extracted.title,
+      price,
+      description: extracted.clean_text,
+      tags,
+      structured_data: extracted.structured_data,
+      embedding,
+      source: ["text", "voice", "file"].includes(source) ? source : "text",
+      createdByChatId: ctx.chat.id,
+    });
+  } catch (err) {
+    console.error("addKnowledge failed:", err.message);
+    await ctx.reply(`❌ Ошибка сохранения: ${err.message}`);
+    return true;
+  }
+
+  const sd = saved.structured_data && typeof saved.structured_data === "object" ? saved.structured_data : {};
+  const tagsOut = Array.isArray(sd.tags) ? sd.tags : tags;
+  const tagsLine = tagsOut.length ? `\n🏷 ${tagsOut.join(", ")}` : "";
+  const pSaved = sd.price != null ? sd.price : price;
+  const priceLine =
+    pSaved !== null && pSaved !== undefined && pSaved !== ""
+      ? `\n💰 ${Number(pSaved).toLocaleString("ru-RU")} ₸`
+      : "";
+  const embNote = saved.embedding == null ? "\n\n⚠️ Без вектора (эмбеддинг не записался) — поиск по смыслу ослаблен." : "";
+  await ctx.reply(
+    `Сохранил 👍 [${kbCategoryLabel(saved.type)}] ${saved.title}${priceLine}${tagsLine}\n\n` +
+      `📝 ${saved.content}\n\n` +
+      `id #${saved.id} — удалить: /knowledge` +
+      embNote
+  );
+  return true;
+}
+
+async function handleKbCallback(ctx, data, chatId) {
+  const parts = data.split(":"); // kb:delete:<id>
+  const action = parts[1];
+  const id = parseInt(parts[2], 10);
+  const msgId = ctx.callbackQuery.message?.message_id;
+
+  if (!action || !id) {
+    await ctx.answerCbQuery("Неверные данные").catch(() => {});
+    return;
+  }
+
+  if (action === "delete") {
+    try {
+      const rec = await getKnowledgeById(id);
+      if (!rec) {
+        await ctx.answerCbQuery("Уже удалено").catch(() => {});
+        if (msgId) await ctx.telegram.editMessageReplyMarkup(chatId, msgId, undefined, { inline_keyboard: [] }).catch(() => {});
+        return;
+      }
+      await deleteKnowledge(id);
+      await ctx.answerCbQuery("Удалено").catch(() => {});
+      if (msgId) {
+        await ctx.telegram.editMessageText(
+          chatId,
+          msgId,
+          undefined,
+          `🗑 #${rec.id} ${kbCategoryLabel(rec.type || rec.category)} ${rec.title || rec.name || ""} — удалено`,
+          { reply_markup: { inline_keyboard: [] } }
+        ).catch(async () => {
+          await ctx.telegram.editMessageReplyMarkup(chatId, msgId, undefined, { inline_keyboard: [] }).catch(() => {});
+        });
+      }
+    } catch (err) {
+      console.error("kb delete failed:", err.message);
+      await ctx.answerCbQuery(`Ошибка: ${err.message}`).catch(() => {});
+    }
+    return;
+  }
+
+  await ctx.answerCbQuery("Неизвестное действие").catch(() => {});
+}
+
+// ─── Commercial Proposal (КП) ────────────────────────────────────────────────
+//
+// /proposal <leadId>           — менеджер вручную просит сгенерировать КП
+// callback lead:proposal:<id>  — кнопка «📄 КП» в уведомлении о новом лиде
+// callback proposal:send|edit|cancel — действия с draft'ом КП
+//
+// Ничего НЕ отправляется клиенту автоматически — только после нажатия «✉ Отправить».
+
+/**
+ * Сгенерировать КП и предложить менеджеру в чат с кнопками Send/Edit/Cancel.
+ * draft сохраняется в proposalDrafts(msgId) с TTL 30 мин.
+ */
+async function proposeProposalDraft(ctx, leadId, leadPreloaded = null) {
+  try {
+    const lead = leadPreloaded || (await getLeadById(leadId));
+    if (!lead) {
+      await ctx.telegram.sendMessage(getManagerChatId(), `Лид #${leadId} не найден.`).catch(() => {});
+      return;
+    }
+
+    const orderData = lead.data || {};
+    let history = [];
+    let lang = lead.data?.lang || "ru";
+    if (lead.conversation_id) {
+      const h = await getConversationHistoryForLead(lead.conversation_id, 10);
+      history = Array.isArray(h?.history) ? h.history : [];
+      if (h?.lang) lang = h.lang;
+    }
+    const lastUserMessage = lastClientMessage(history);
+
+    // RAG-lite: knowledge_base context — для подстановки цен/материалов как ориентир.
+    let knowledgeContext = "";
+    try {
+      knowledgeContext = await buildKnowledgeContext({
+        lastUserMessage: lastUserMessage || orderData?.description || orderData?.type || "",
+        orderData,
+        lang,
+      });
+    } catch (err) {
+      console.error("[proposal] buildKnowledgeContext failed:", err.message);
+    }
+
+    const text = await generateProposal({ orderData, history, lang, knowledgeContext });
+
+    if (!text) {
+      await ctx.telegram.sendMessage(
+        getManagerChatId(),
+        `⚠️ Не удалось сгенерировать КП для лида #${leadId}.\n` +
+        `Можно сгенерировать заново: /proposal ${leadId}`
+      ).catch(() => {});
+      return;
+    }
+
+    // Шаг 1: отправить с временным разметом, msgId ещё не известен.
+    const sent = await ctx.telegram.sendMessage(
+      getManagerChatId(),
+      `💼 КП для лида #${leadId}:\n\n«${text}»`,
+      {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: "✉ Отправить клиенту", callback_data: `proposal:send:${leadId}:0` },
+              { text: "✏️ Изменить",         callback_data: `proposal:edit:${leadId}` },
+              { text: "✗ Отмена",            callback_data: `proposal:cancel:0` },
+            ],
+          ],
+        },
+      }
+    );
+
+    const msgId = sent.message_id;
+    setProposalDraft(msgId, { leadId, text, lang });
+
+    // Шаг 2: переприклеить кнопки с актуальным msgId, чтобы send/cancel брали draft по нему.
+    await ctx.telegram.editMessageReplyMarkup(getManagerChatId(), msgId, undefined, {
+      inline_keyboard: [
+        [
+          { text: "✉ Отправить клиенту", callback_data: `proposal:send:${leadId}:${msgId}` },
+          { text: "✏️ Изменить",         callback_data: `proposal:edit:${leadId}` },
+          { text: "✗ Отмена",            callback_data: `proposal:cancel:${msgId}` },
+        ],
+      ],
+    }).catch(() => {});
+  } catch (err) {
+    console.error("proposeProposalDraft error:", err.message);
+    await ctx.telegram.sendMessage(getManagerChatId(), `⚠️ Ошибка генерации КП: ${err.message}`).catch(() => {});
+  }
+}
+
+/**
+ * Обработка proposal:* callback'ов.
+ *   proposal:send:<leadId>:<msgId>  — отправить draft клиенту
+ *   proposal:edit:<leadId>          — открыть ForceReply, менеджер пишет свой текст КП
+ *   proposal:cancel:<msgId>         — отбой, удалить кнопки и draft
+ */
+async function handleProposalCallback(ctx, data, chatId) {
+  const parts = data.split(":");
+  const action = parts[1];
+  const msgId = ctx.callbackQuery.message?.message_id;
+
+  try {
+    if (action === "send") {
+      const leadId = parseInt(parts[2], 10);
+      const draftMsgId = parseInt(parts[3], 10) || msgId;
+      const draft = getProposalDraft(draftMsgId);
+      if (!draft || draft.leadId !== leadId) {
+        await ctx.answerCbQuery("Черновик устарел. Сгенерируйте КП заново.").catch(() => {});
+        if (msgId) {
+          await ctx.telegram.editMessageReplyMarkup(chatId, msgId, undefined, { inline_keyboard: [] }).catch(() => {});
+        }
+        return;
+      }
+      await sendManagerProposalToClient(ctx, leadId, draft.text);
+      deleteProposalDraft(draftMsgId);
+      await ctx.answerCbQuery("КП отправлено клиенту").catch(() => {});
+      if (msgId) {
+        await ctx.telegram.editMessageReplyMarkup(chatId, msgId, undefined, { inline_keyboard: [] }).catch(() => {});
+      }
+      return;
+    }
+
+    if (action === "edit") {
+      const leadId = parseInt(parts[2], 10);
+      // Снять кнопки у предложения, чтобы не зависало.
+      if (msgId) {
+        await ctx.telegram.editMessageReplyMarkup(chatId, msgId, undefined, { inline_keyboard: [] }).catch(() => {});
+        deleteProposalDraft(msgId);
+      }
+      const sent = await ctx.telegram.sendMessage(
+        chatId,
+        `✏️ Введите свой вариант КП для клиента по лиду #${leadId}:`,
+        { reply_markup: { force_reply: true, selective: true } }
+      );
+      pendingProposalEdit.set(getManagerChatId(), { leadId, promptMessageId: sent.message_id });
+      await ctx.answerCbQuery("Ответьте на это сообщение").catch(() => {});
+      return;
+    }
+
+    if (action === "cancel") {
+      const draftMsgId = parseInt(parts[2], 10) || msgId;
+      if (draftMsgId) deleteProposalDraft(draftMsgId);
+      if (msgId) {
+        await ctx.telegram.editMessageReplyMarkup(chatId, msgId, undefined, { inline_keyboard: [] }).catch(() => {});
+      }
+      await ctx.answerCbQuery("Отменено").catch(() => {});
+      return;
+    }
+
+    await ctx.answerCbQuery("Неизвестное действие").catch(() => {});
+  } catch (err) {
+    console.error("handleProposalCallback error:", err.message);
+    await ctx.answerCbQuery(`Ошибка: ${err.message}`).catch(() => {});
+  }
+}
+
+/**
+ * /proposal <leadId> — менеджер запрашивает генерацию КП.
+ */
+async function handleProposalCommand(ctx) {
+  const raw = (ctx.message?.text || "").replace(/^\/proposal(@\w+)?\s*/, "").trim();
+  const m = raw.match(/^(\d+)\s*$/);
+  if (!m) {
+    await ctx.reply("Использование: /proposal <ID лида>\nПример: /proposal 12");
+    return;
+  }
+  const leadId = parseInt(m[1], 10);
+  await proposeProposalDraft(ctx, leadId);
+}
+
+/**
+ * Отправить КП клиенту от имени менеджера (после нажатия «✉ Отправить» или ручного edit).
+ * Дописывает в conversation history (статус лида только по кнопке «Взять»).
+ */
+async function sendManagerProposalToClient(ctx, leadId, proposalText) {
+  try {
+    const lead = await getLeadById(leadId);
+    if (!lead) {
+      await ctx.reply(`Лид #${leadId} не найден.`);
+      return;
+    }
+    if (!lead.telegram_chat_id) {
+      await ctx.reply(`У лида #${leadId} нет chat_id клиента.`);
+      return;
+    }
+
+    const cLang = lead.data?.lang || "ru";
+    const header = {
+      ru: "💼 Коммерческое предложение:",
+      kk: "💼 Коммерциялық ұсыныс:",
+      en: "💼 Commercial proposal:",
+    }[cLang] || "💼 Коммерческое предложение:";
+
+    const msg = `${header}\n\n${proposalText}`;
+    await _bot.telegram.sendMessage(String(lead.telegram_chat_id), msg);
+
+    if (lead.conversation_id) {
+      await appendConversationMessage(lead.conversation_id, "manager", `[КП] ${proposalText}`);
+    }
+
+    await ctx.reply(`✓ КП отправлено клиенту по лиду #${leadId}.`);
+  } catch (err) {
+    console.error("sendManagerProposalToClient error:", err.message);
+    await ctx.reply(`Ошибка отправки КП: ${err.message}`);
+  }
+}
