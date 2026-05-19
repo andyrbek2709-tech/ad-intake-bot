@@ -1,4 +1,7 @@
 import {
+import { getClientProfile, formatClientProfile, getClientTimeline, formatTimeline } from "../services/clientHistory.js";
+import { getDailyReport, formatDailyReport, getWeeklyReport, formatWeeklyReport } from "../services/reporting.js";
+import { findManagerForOrder, logRouting } from "../services/routing.js";
   chat,
   detectLang,
   describeImage,
@@ -2911,4 +2914,44 @@ async function sendManagerProposalToClient(ctx, leadId, proposalText) {
     console.error("sendManagerProposalToClient error:", err.message);
     await ctx.reply(`Ошибка отправки КП: ${err.message}`);
   }
+
+  // MANAGER COMMANDS
+  
+  // /profile <user_id> - Get client profile
+  bot.command('profile', async (ctx) => {
+    const parts = ctx.message.text.split(' ');
+    const telegramId = parts[1];
+    if (!telegramId || isNaN(telegramId)) {
+      return ctx.reply('Использование: /profile <telegram_user_id>');
+    }
+    const profile = await getClientProfile(telegramId);
+    const formatted = formatClientProfile(profile);
+    await ctx.reply(formatted, { parse_mode: 'Markdown' });
+  });
+
+  // /timeline <user_id> - Get client activity timeline
+  bot.command('timeline', async (ctx) => {
+    const parts = ctx.message.text.split(' ');
+    const telegramId = parts[1];
+    if (!telegramId || isNaN(telegramId)) {
+      return ctx.reply('Использование: /timeline <telegram_user_id>');
+    }
+    const timeline = await getClientTimeline(telegramId);
+    const formatted = formatTimeline(timeline);
+    await ctx.reply(formatted);
+  });
+
+  // /report_today - Daily report
+  bot.command('report_today', async (ctx) => {
+    const report = await getDailyReport();
+    const formatted = formatDailyReport(report);
+    await ctx.reply(formatted, { parse_mode: 'Markdown' });
+  });
+
+  // /report_week - Weekly report
+  bot.command('report_week', async (ctx) => {
+    const report = await getWeeklyReport();
+    const formatted = formatWeeklyReport(report);
+    await ctx.reply(formatted, { parse_mode: 'Markdown' });
+  });
 }
